@@ -1,5 +1,26 @@
 # Changelog
 
+## v3.2.0 — 2026-06-12
+
+**Transcript signal, all-time records, CLI graphs.**
+
+- Second beat source: Claude Code transcripts at `~/.claude/projects/**/*.jsonl`.
+  Every user prompt becomes a beat, merged into the existing block-stitching
+  pipeline. Cross-project visibility, retroactive backfill (no hook needed for
+  history), and resilience when the hook isn't installed. Best-effort: missing or
+  unreadable transcripts silently fall back to heartbeats. 30-day lookback cap,
+  500-file cap to keep `status` snappy.
+- All-time records persisted in `state.records`: longest single sprint
+  (`longest_block_min_alltime` + when), longest active-day streak, current streak.
+  Updated on every score computation, surfaced in `status` and `report`.
+- `report` gains two CLI graphs (stdlib Unicode, no deps):
+  - 14-day daily-focus sparkline (`▁▂▃▄▅▆▇█`)
+  - 7×24 hour-of-day × day-of-week heatmap in local time, so you can see when
+    your focus actually lands
+- v3 → v4 state migration; `from __future__ import annotations` for cleaner
+  forward-compat (the engine now imports cleanly on Python 3.9 too, though 3.10+
+  remains the supported floor).
+
 ## v3.1.0 — 2026-06-12
 
 **Tone modes.** `burnout.py tone sarcastic|supportive|show`.

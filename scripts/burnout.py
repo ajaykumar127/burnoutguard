@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v3: attention-time tracking + Claude Code hooks).
+burnout.py — Burnout Guard engine (v3.2: + transcript signal, records, CLI graph).
 
 WHAT IT MEASURES (and deliberately doesn't)
   Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
@@ -9,6 +9,13 @@ WHAT IT MEASURES (and deliberately doesn't)
   every prompt you send records a beat; beats <15 min apart stitch into continuous
   work blocks; blocks yield daily active hours, longest-stretch intensity, late-night
   work, and grind streaks. Self-report still leads (60%).
+
+  v3.2 adds a SECOND beat source: Claude Code transcripts at ~/.claude/projects/.
+  Each user prompt in those JSONL files is a beat. Transcripts give us cross-project
+  visibility, retroactive backfill (no hook needed for history), and survive when the
+  hook isn't installed. They're best-effort and merge into the same block-stitching
+  pipeline; if the directory is missing or unreadable we silently fall back to
+  heartbeats. claude.ai still relies on `log-session` + check-ins.
 
 THE SIX LEVELS
   L0 Flow 0-24 | L1 Watch 25-39 | L2 Friction 40-54 | L3 Throttle 55-64
@@ -37,6 +44,8 @@ Exit codes: 0 work may proceed (L0-L2), 5 THROTTLED (L3), 10 LOCKED (L4/L5), 2 u
 crash a prompt.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -50,6 +59,10 @@ HOME = Path(os.environ.get("BURNOUT_GUARD_HOME", Path.home() / ".burnout-guard")
 STATE_FILE = HOME / "state.json"
 CLAUDE_SETTINGS = Path(os.environ.get("CLAUDE_SETTINGS_PATH",
                                       Path.home() / ".claude" / "settings.json"))
+TRANSCRIPTS_ROOT = Path(os.environ.get("CLAUDE_PROJECTS_PATH",
+                                       Path.home() / ".claude" / "projects"))
+TRANSCRIPT_LOOKBACK_DAYS = 30      # cap: scan files modified within this window
+TRANSCRIPT_MAX_FILES = 500         # cap: refuse to scan obscene transcript counts
 
 LEVELS = [
     (0, "Flow",          0,  24),
@@ -105,7 +118,7 @@ def parse(ts: str) -> datetime:
 
 def default_state() -> dict:
     return {
-        "version": 3,
+        "version": 4,
         "config": {"tone": "supportive"},
         "created_at": iso(now()),
         "blocks": [],          # [{start, end, beats, late_night}] continuous work blocks
@@ -116,6 +129,7 @@ def default_state() -> dict:
         "override_penalty": 0,
         "last_alerts": {},     # {alert_key: iso_ts} rate limiting
         "events": [],
+        "records": {},         # all-time bests: longest sprint, longest streak
     }
 
 def load_state() -> dict:
@@ -135,8 +149,10 @@ def load_state() -> dict:
     if v < 3:
         state.setdefault("blocks", [])
         state.setdefault("last_alerts", {})
+    if v < 4:
+        state.setdefault("records", {})
     state.setdefault("config", {"tone": "supportive"})
-    state["version"] = 3
+    state["version"] = 4
     return state
 
 def save_state(state: dict) -> None:
@@ -173,11 +189,136 @@ def record_beat(state: dict) -> dict:
 def block_minutes(b: dict) -> float:
     return (parse(b["end"]) - parse(b["start"])).total_seconds() / 60
 
+# ---------------------------------------------------------------- transcripts
+
+def parse_iso_z(ts: str) -> datetime | None:
+    """Parse Claude Code transcript timestamps. Tolerates trailing Z (3.10-safe)."""
+    if not isinstance(ts, str):
+        return None
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+def transcript_beats(cutoff: datetime) -> list[datetime]:
+    """Read ~/.claude/projects/**/*.jsonl and return user-prompt timestamps >= cutoff.
+
+    Best-effort: returns [] on any error. Skips tool-result events (those have a list
+    `content`); only counts genuine user prompts. Honors lookback + file caps so a
+    user with hundreds of projects doesn't pay an O(N) tax on every status call."""
+    beats: list[datetime] = []
+    if not TRANSCRIPTS_ROOT.exists() or not TRANSCRIPTS_ROOT.is_dir():
+        return beats
+    file_floor = (now() - timedelta(days=TRANSCRIPT_LOOKBACK_DAYS)).timestamp()
+    files: list[Path] = []
+    try:
+        for proj in TRANSCRIPTS_ROOT.iterdir():
+            if not proj.is_dir():
+                continue
+            try:
+                for jsonl in proj.glob("*.jsonl"):
+                    try:
+                        if jsonl.stat().st_mtime >= file_floor:
+                            files.append(jsonl)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    except OSError:
+        return beats
+    if len(files) > TRANSCRIPT_MAX_FILES:
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        files = files[:TRANSCRIPT_MAX_FILES]
+
+    for jsonl in files:
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"type":"user"' not in line and '"type": "user"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("type") != "user":
+                        continue
+                    msg = ev.get("message") or {}
+                    # Tool-result envelopes carry a list content; real prompts are str.
+                    if not isinstance(msg.get("content"), str):
+                        continue
+                    dt = parse_iso_z(ev.get("timestamp", ""))
+                    if dt is None or dt < cutoff:
+                        continue
+                    beats.append(dt)
+        except (OSError, IOError):
+            continue
+    beats.sort()
+    return beats
+
+def stitch_intervals(items: list[tuple[datetime, datetime, int, bool]]) -> list[dict]:
+    """Merge (start, end, beats, late) tuples into blocks using BLOCK_GAP_MIN."""
+    items = sorted(items)
+    merged: list[list] = []
+    gap = timedelta(minutes=BLOCK_GAP_MIN)
+    for s, e, beats, late in items:
+        if merged and s - merged[-1][1] <= gap:
+            merged[-1][1] = max(merged[-1][1], e)
+            merged[-1][2] += beats
+            merged[-1][3] = merged[-1][3] or late
+        else:
+            merged.append([s, e, beats, late])
+    return [{"start": iso(s), "end": iso(e), "beats": b, "late_night": l}
+            for s, e, b, l in merged]
+
+def unified_blocks(state: dict, days: int) -> list[dict]:
+    """State blocks + transcript-derived beats, merged into a single timeline."""
+    cutoff = now() - timedelta(days=days)
+    items: list[tuple[datetime, datetime, int, bool]] = []
+    for b in state.get("blocks", []):
+        s, e = parse(b["start"]), parse(b["end"])
+        if e < cutoff:
+            continue
+        items.append((s, e, int(b.get("beats", 1)), bool(b.get("late_night", False))))
+    for t in transcript_beats(cutoff):
+        items.append((t, t, 1, is_late(t.astimezone())))
+    return stitch_intervals(items)
+
+# ---------------------------------------------------------------- records
+
+def update_records(state: dict, blocks: list[dict]) -> None:
+    """Track all-time longest sprint and longest active-day streak (idempotent)."""
+    rec = state.setdefault("records", {})
+    if blocks:
+        longest = max(blocks, key=block_minutes)
+        cur = round(block_minutes(longest), 1)
+        if cur > rec.get("longest_block_min_alltime", 0):
+            rec["longest_block_min_alltime"] = cur
+            rec["longest_block_at"] = longest["end"]
+    days_active = {parse(b["start"]).date() for b in blocks}
+    streak, d = 0, now().date()
+    while d in days_active:
+        streak += 1
+        d -= timedelta(days=1)
+    if streak > rec.get("longest_streak_days_alltime", 0):
+        rec["longest_streak_days_alltime"] = streak
+        rec["longest_streak_at"] = iso(now())
+    rec["current_streak_days"] = streak
+
+# ---------------------------------------------------------------- behaviour
+
 def behaviour_score(state: dict) -> dict:
-    """0-100 plus components, from blocks (+legacy sessions) over trailing 7 days."""
+    """0-100 plus components, from merged blocks (+legacy sessions) over trailing 7 days.
+
+    Sources merged: state['blocks'] (heartbeat-stitched, real-time) + Claude Code
+    transcript prompts (cross-project, retroactive). Legacy `sessions` are still
+    honoured as 30-min day credits. Records (longest-ever sprint, streak) are updated
+    here so every score computation keeps them current."""
     cutoff = now() - timedelta(days=7)
-    blocks = [b for b in state["blocks"] if parse(b["end"]) >= cutoff]
+    blocks = unified_blocks(state, days=7)
     sessions = [s for s in state["sessions"] if parse(s["ts"]) >= cutoff]
+    update_records(state, unified_blocks(state, days=TRANSCRIPT_LOOKBACK_DAYS))
 
     daily_min: dict = {}
     for b in blocks:
@@ -495,6 +636,7 @@ def cmd_status(args):
                       "effective_level_name": dict((l, n) for l, n, *_ in LEVELS)[effective],
                       "cooldown": cd, "parking_lot_size": len(state["parking_lot"]),
                       "verdict": verdict, "tone": tone_of(state),
+                      "records": state.get("records", {}),
                       "instruction": LEVEL_INSTRUCTIONS[effective]},
                      indent=2))
     sys.exit(code)
@@ -646,6 +788,76 @@ def cmd_history(args):
                       "recent_events": state["events"][-args.n:],
                       "parking_lot": state["parking_lot"]}, indent=2))
 
+SPARK_BARS = "▁▂▃▄▅▆▇█"
+
+def sparkline(values: list[float]) -> str:
+    if not values:
+        return ""
+    hi = max(values)
+    if hi <= 0:
+        return SPARK_BARS[0] * len(values)
+    out = []
+    for v in values:
+        if v <= 0:
+            out.append(" ")
+        else:
+            out.append(SPARK_BARS[min(len(SPARK_BARS) - 1,
+                                      int(v / hi * (len(SPARK_BARS) - 1) + 0.5))])
+    return "".join(out)
+
+def daily_minutes(blocks: list[dict], days: int) -> list[tuple[str, float]]:
+    """Returns [(YYYY-MM-DD, minutes)] for the last `days` days, oldest first."""
+    today = now().astimezone().date()
+    bucket: dict = {today - timedelta(days=i): 0.0 for i in range(days)}
+    for b in blocks:
+        s, e = parse(b["start"]).astimezone(), parse(b["end"]).astimezone()
+        cur = s
+        while cur < e:
+            day_end = datetime.combine(cur.date(), datetime.min.time(),
+                                       tzinfo=cur.tzinfo) + timedelta(days=1)
+            chunk_end = min(day_end, e)
+            mins = (chunk_end - cur).total_seconds() / 60
+            if cur.date() in bucket:
+                bucket[cur.date()] += mins
+            cur = chunk_end
+    return [(d.isoformat(), round(m, 1))
+            for d, m in sorted(bucket.items())]
+
+HEATMAP_SHADES = " ░▒▓█"
+
+def heatmap_7x24(blocks: list[dict]) -> list[str]:
+    """7×24 grid (Mon..Sun × hour-of-day) of focused minutes. Local time."""
+    grid = [[0.0] * 24 for _ in range(7)]
+    for b in blocks:
+        s = parse(b["start"]).astimezone()
+        e = parse(b["end"]).astimezone()
+        cur = s.replace(minute=0, second=0, microsecond=0)
+        while cur < e:
+            nxt = cur + timedelta(hours=1)
+            mins = (min(nxt, e) - max(cur, s)).total_seconds() / 60
+            if mins > 0:
+                grid[cur.weekday()][cur.hour] += mins
+            cur = nxt
+    flat = [v for row in grid for v in row]
+    hi = max(flat) if flat else 0
+    if hi <= 0:
+        return ["  (no recorded activity in window)"]
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    header = "      " + "".join(f"{h:>3}" for h in (0, 3, 6, 9, 12, 15, 18, 21))
+    lines = [header]
+    for i, row in enumerate(grid):
+        cells = ""
+        for v in row:
+            if v <= 0:
+                cells += HEATMAP_SHADES[0]
+            else:
+                idx = min(len(HEATMAP_SHADES) - 1,
+                          1 + int((v / hi) * (len(HEATMAP_SHADES) - 2) + 0.5))
+                cells += HEATMAP_SHADES[idx]
+        lines.append(f"  {days[i]} {cells}")
+    lines.append(f"  legend: {HEATMAP_SHADES} (none → ~{int(hi)} min/cell)")
+    return lines
+
 def cmd_report(args):
     state = load_state()
     score = compute_index(state)
@@ -655,6 +867,13 @@ def cmd_report(args):
     checkins = [c for c in state["checkins"] if parse(c["ts"]) >= cutoff]
     lockouts = [e for e in state["events"]
                 if e["type"] == "cooldown_start" and parse(e["ts"]) >= cutoff]
+    blocks_14 = unified_blocks(state, days=14)
+    rec = state.get("records", {})
+
+    daily = daily_minutes(blocks_14, 14)
+    spark = sparkline([m for _, m in daily])
+    peak_min = max((m for _, m in daily), default=0)
+
     lines = [
         "# Burnout Guard — 14-day report",
         f"\n**Current index:** {score['index']} — **L{score['level']} {score['level_name']}**",
@@ -666,6 +885,15 @@ def cmd_report(args):
         f"- Late-night blocks: {bd['late_night_blocks_7d']}",
         f"- Active-day streak: {bd['streak_days']}",
         f"- Behaviour score: {bd['score']}/100",
+        f"\n## Daily focus (14d, mins/day, peak ~{int(peak_min)})",
+        f"  {daily[0][0]} {spark} {daily[-1][0]}",
+        f"\n## Hour-of-day × day-of-week (14d, local time)",
+        *heatmap_7x24(blocks_14),
+        f"\n## Records",
+        f"- Longest sprint ever: {rec.get('longest_block_min_alltime', 0)} min"
+        + (f" (on {rec['longest_block_at']})" if rec.get('longest_block_at') else ""),
+        f"- Longest active-day streak: {rec.get('longest_streak_days_alltime', 0)} day(s)"
+        + (f", current streak: {rec.get('current_streak_days', 0)}"),
         f"\n## Self-report\n- Check-ins (14d): {len(checkins)}",
     ]
     if checkins:
@@ -680,6 +908,8 @@ def cmd_report(args):
     if len(lockouts) >= 2:
         lines.append("\n> Two or more lockouts in 14 days. The pattern, not the timer, is "
                      "the signal — consider a conversation with a GP or occupational health.")
+    # Persist any updates update_records made via behaviour_score.
+    save_state(state)
     print("\n".join(lines))
 
 def cmd_tone(args):

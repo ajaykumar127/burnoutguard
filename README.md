@@ -44,6 +44,14 @@ apart stitch into continuous work blocks, and the trailing week yields: average
 focused hours/day, longest unbroken stretch, late-night blocks, and active-day
 streaks. Self-report still carries 60%; behaviour corroborates.
 
+**v3.2 adds a second beat source: Claude Code transcripts** at
+`~/.claude/projects/**/*.jsonl`. Every prompt across every project becomes a beat,
+merged into the same pipeline — so you get cross-project visibility, retroactive
+backfill (no hook install needed for history), and resilience if the hook is ever
+disabled. `burnout.py report` now renders a 14-day focus **sparkline** and a 7×24
+**hour-of-day × day-of-week heatmap** so you can actually see where your focus is
+landing, plus all-time records: longest sprint and longest active-day streak.
+
 ## Real enforcement + console alerts in Claude Code
 
 ```bash
