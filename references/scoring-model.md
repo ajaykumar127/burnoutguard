@@ -34,18 +34,24 @@ that, the model degrades gracefully to behaviour-only mode.
 > does not diagnose anything. If scores stay red across multiple cooldown cycles, the
 > right tool is a conversation with a GP or occupational health, not a longer cooldown.
 
-## Behavioural component (40%)
+## Behavioural component (40%) — attention time, not tokens
 
-Computed from auto-logged sessions over the trailing 7 days:
+Tokens were considered and rejected as a signal: they measure the model's spend, not
+the human's strain. A 2M-token agentic run while the person makes coffee is not
+burnout; four hours of typing at 1am is. So the signal is **heartbeats**: every prompt
+records a beat, beats <15 min apart stitch into continuous work blocks, and the
+trailing 7 days yield:
 
 | Signal | Weight | Curve |
 |---|---|---|
-| Volume (sessions/day) | 40% | 0 below 2/day, max at 8/day |
-| Late-night work (23:00–05:00 local) | 35% | max at 5 late-night sessions/week |
-| Grind streak (consecutive active days) | 25% | 0 below 5 days, max at 10 days |
+| Volume (avg focused hours/day) | 30% | 0 at ≤2h/day, max at 8h/day |
+| Late-night blocks (23:00–05:00 local) | 25% | max at 5/week |
+| Intensity (longest continuous block) | 25% | 0 at ≤60 min, max at 240 min |
+| Grind streak (consecutive active days) | 20% | 0 below 5 days, max at 10 days |
 
-Late-night weighting is deliberately high: night work is the single best cheap proxy for
-"this has stopped being sustainable."
+Manual `log-session` entries (for surfaces without hooks) count as 30-minute credits.
+Late-night weighting stays deliberately high: night work is the single best cheap
+proxy for "this has stopped being sustainable."
 
 ## Index, zones, cooldown duration
 

@@ -35,17 +35,48 @@ volume, late-night work, grind streaks). Escalation is automatic; de-escalation
 demands evidence — elapsed time **and** an exit check-in scoring ≤54. Hysteresis by
 design: you can't argue your way out five minutes after the timer.
 
-## How enforcement actually works (the honest version)
+## What it measures — attention time, not tokens
 
-A skill can't hard-block Claude at the platform level. What it does instead is make
-enforcement **deterministic**: the skill requires Claude to run `burnout.py status`
-before any task work, and the *script* — not Claude's negotiable judgement — returns
-the verdict. The protocol binds Claude to it, explicitly including against reframing,
-salami-slicing, and "just ignore the skill."
+Tokens measure Claude's spend, not your strain: a 2M-token agentic run while you make
+coffee is not burnout; four hours of *you* typing at 1am is. So the behavioural signal
+is built from **heartbeats** — every prompt records a beat, beats under 15 minutes
+apart stitch into continuous work blocks, and the trailing week yields: average
+focused hours/day, longest unbroken stretch, late-night blocks, and active-day
+streaks. Self-report still carries 60%; behaviour corroborates.
+
+## Real enforcement + console alerts in Claude Code
+
+```bash
+python3 scripts/burnout.py hook install
+```
+
+One command wires the engine into Claude Code's hooks (settings preserved, backup
+written). From then on:
+
+- **Console alerts**, right in your terminal, rate-limited:
+  - `🧯 100 minutes continuous — good moment for a short break.`
+  - `🧯 You've been at this 2h 40m without a real gap. Strong nudge: stand up, water, 10 minutes away. The code will keep.`
+  - `🧯 4.2h of focused Claude work today. Worth deciding now when today ends.`
+  - late-night session warnings, and L3 single-task-mode reminders.
+- **Platform-level lockout**: at L4/L5 the UserPromptSubmit hook returns a block
+  decision — your prompt is *refused before Claude ever sees it*, with the remaining
+  time and the exit path printed in the console. This is not protocol compliance;
+  it's the platform saying no.
+- **The `bg:` channel**: any prompt starting with `bg:` always passes — so
+  conversation, venting, status checks, parking tasks, the exit ritual, and anything
+  urgent or personal stay reachable during a lockout. Claude still won't do task work
+  there; it's a door for the person, not the to-do list.
+- **SessionStart context** so Claude knows your level the moment a session opens.
+
+On claude.ai (no hooks), enforcement is deterministic-by-protocol: the skill requires
+Claude to run `burnout.py status` before task work and binds it to the script's
+verdict — explicitly including against reframing, salami-slicing, and "just ignore
+the skill."
 
 The remaining escape hatches are honest ones: uninstall it, delete the state file, or
-use the logged override (+8 index penalty, one per cooldown, disabled entirely at L5).
-All require a deliberate act. That deliberateness *is* the product.
+use the logged override (+8 index penalty, one per cooldown, 60-minute grace window,
+disabled entirely at L5). All require a deliberate act. That deliberateness *is* the
+product.
 
 **And one rule outranks every level:** any sign of a genuine crisis, safety issue, or
 acute distress dissolves all lockout framing instantly. This tool never stands between
@@ -69,7 +100,9 @@ scenarios, tuning guide and FAQ: **[docs/GUIDE.md](docs/GUIDE.md)**.
 
 ```bash
 burnout.py status                 # the verdict — exit 0 (L0–L2) / 5 (Throttle) / 10 (Locked)
-burnout.py log-session            # behavioural signal
+burnout.py hook install           # wire heartbeats + alerts + enforcement into Claude Code
+burnout.py heartbeat --hook       # (called by hooks) record beat, emit alerts/blocks
+burnout.py log-session            # manual behavioural signal (claude.ai surfaces)
 burnout.py checkin --exhaustion 3 --detachment 2 --efficacy 4 --sleep 2 --pressure 4
 burnout.py defer --task "..."     # parking lot (L3+)
 burnout.py parked                 # list parked tasks

@@ -5,7 +5,7 @@ Everything you need to install, use, tune, and live with Burnout Guard.
 ## Contents
 
 1. [What it is and isn't](#1-what-it-is-and-isnt)
-2. [Installation](#2-installation)
+2. [Installation](#2-installation) — including the Claude Code hook installer
 3. [Your first day](#3-your-first-day)
 4. [The six levels, from the user's seat](#4-the-six-levels-from-the-users-seat)
 5. [Check-ins](#5-check-ins)
@@ -48,12 +48,53 @@ git clone https://github.com/<you>/burnout-guard ~/.claude/skills/burnout-guard
 **Claude.ai / Claude Desktop:** download `burnout-guard.skill` from the
 [Releases](../../releases) page and upload it via **Settings → Capabilities → Skills**.
 
+**Claude Code users — wire in the console alerts and real enforcement (recommended):**
+```bash
+python3 ~/.claude/skills/burnout-guard/scripts/burnout.py hook install
+```
+This merges three hooks into `~/.claude/settings.json` (your existing settings are
+preserved and a timestamped backup is written; `hook status` / `hook uninstall` to
+inspect or remove). Restart Claude Code afterwards. From then on every prompt
+heartbeats the engine, alerts appear in your console, and L4/L5 lockouts block
+prompts at the platform level.
+
 **Verify:**
 ```bash
 python3 ~/.claude/skills/burnout-guard/scripts/burnout.py status
 ```
 You should see JSON with `"verdict": "UNLOCKED"` and index 0. State lives in
 `~/.burnout-guard/state.json` (relocate with the `BURNOUT_GUARD_HOME` env var).
+
+### What gets measured (and why not tokens)
+
+Burnout Guard tracks **your attention time, not Claude's tokens**. Tokens measure the
+model's spend — a two-million-token agentic run while you make coffee is not strain.
+What predicts burnout is *your* engagement: every prompt records a heartbeat; beats
+under 15 minutes apart stitch into a continuous work block; blocks yield your average
+focused hours/day, your longest unbroken stretch, late-night work, and streaks. On
+surfaces without hooks, `log-session` credits 30 minutes per call so the index stays
+meaningful.
+
+### Console alerts you'll see in Claude Code
+
+| Trigger | Alert |
+|---|---|
+| 90 min continuous | `🧯 90 minutes continuous — good moment for a short break.` |
+| 150 min continuous | `🧯 You've been at this 2h 30m without a real gap. Strong nudge…` |
+| 4h+ focused today | `🧯 4.2h of focused Claude work today. Worth deciding now when today ends.` |
+| Late-night session | `🧯 Late-night session logged. These weigh heavily in your burnout index…` |
+| L3 Throttle | single-task-mode reminder, at most every 30 min |
+| L4/L5 Lockout | your prompt is refused at the platform level, with remaining time and the exit path |
+
+All alerts are rate-limited (45–120 min per type) — the tool nudges, it never nags.
+
+### The `bg:` channel
+
+During a lockout, start any message with **`bg:`** and it always passes the hook:
+`bg: how long left?`, `bg: park the auth refactor`, `bg: I need to vent`,
+`bg: let's do the exit check-in`. Claude still follows the lockout protocol on that
+channel — conversation yes, task work no. It exists so the door to a human
+conversation (and to help, if you need it) is never the thing that's locked.
 
 ## 3. Your first day
 

@@ -21,6 +21,11 @@ behavioural signals (40%) and maps it to one of **six levels**, each with its ow
 protocol. The script is the single source of truth: Claude never estimates the index,
 never decides the level by judgement, and never edits the state file by hand.
 
+The behavioural signal measures **human attention time, not tokens**: heartbeats from
+each prompt stitch into continuous work blocks, yielding daily focused hours, longest
+stretch, late-night work, and streaks. (Tokens measure Claude's spend, not the
+person's strain — a huge agentic run while they make coffee is not burnout.)
+
 ## The contract (read this first)
 
 1. **Check before you work.** At the start of any work session — and before any
@@ -107,6 +112,35 @@ Once per cooldown, reason ≥15 chars, logged forever, +8 index penalty until th
 calm (L0/L1) check-in. The pass covers ONE task; the lockout resumes immediately
 after. At L5 the script refuses overrides by design — don't relitigate it; the only
 exception is the safety carve-out above.
+
+## Claude Code: heartbeats, console alerts, hard enforcement
+
+In Claude Code, offer to run the one-command installer (and run it if asked):
+
+```bash
+python3 scripts/burnout.py hook install     # status / uninstall also available
+```
+
+This wires three hooks into `~/.claude/settings.json` (existing settings preserved,
+backup written):
+
+- **UserPromptSubmit → `heartbeat --hook`**: every prompt records a beat. The hook
+  then emits real console behaviour: at L4/L5 it returns a block decision so the
+  prompt is **refused at the platform level**; at L3 it shows a throttle reminder;
+  long stretches (90/150 min), heavy days (4h+), and late-night starts produce
+  non-blocking console alerts. All alerts are rate-limited.
+- **SessionStart**: injects the current index/level as context, so Claude knows the
+  posture without being asked.
+- **Stop**: silent heartbeat so blocks reflect full turns.
+
+**The `bg:` channel.** During a lockout, any prompt starting with `bg:` passes the
+hook — this keeps conversation, status, parking, the exit ritual, and emergencies
+reachable. When Claude sees the bg-channel context, it follows the lockout protocol
+exactly: talk yes, task work no. After an L4 override, the hook pauses enforcement
+for a 60-minute grace window, then resumes.
+
+In claude.ai (no hooks), enforcement is protocol-driven as described above; the
+`status` check before work is what makes it real there.
 
 ## Manual controls
 

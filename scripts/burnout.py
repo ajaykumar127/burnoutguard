@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v2, graduated levels).
+burnout.py — Burnout Guard engine (v3: attention-time tracking + Claude Code hooks).
 
-Single source of truth for burnout scoring, level state, and enforcement.
-Claude (or a human) interacts via subcommands; whether and how work proceeds
-comes from `status` — never from judgement calls.
+WHAT IT MEASURES (and deliberately doesn't)
+  Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
+  spend; a two-million-token agentic run while you make coffee is not strain. Four
+  hours of you typing at 1am is. So the behavioural signal is built from heartbeats:
+  every prompt you send records a beat; beats <15 min apart stitch into continuous
+  work blocks; blocks yield daily active hours, longest-stretch intensity, late-night
+  work, and grind streaks. Self-report still leads (60%).
 
 THE SIX LEVELS
-  L0  Flow          0–24   normal operation
-  L1  Watch        25–39   normal + score surfaced once per session
-  L2  Friction     40–54   work allowed; breaks suggested; check-in nudged
-  L3  Throttle     55–64   single-task mode; everything else goes to the parking lot
-  L4  Lockout      65–84   mandatory cooldown 12–36h; one logged override available
-  L5  Hard Lockout 85–100  cooldown 36–72h; NO override; exit needs a recovery plan
+  L0 Flow 0-24 | L1 Watch 25-39 | L2 Friction 40-54 | L3 Throttle 55-64
+  L4 Lockout 65-84 (cooldown 12-36h, one override) | L5 Hard Lockout 85-100
+  (cooldown 36-72h, no override, exit needs a recovery plan)
+
+CLAUDE CODE INTEGRATION (real enforcement + console alerts)
+  `burnout.py hook install` wires this engine into ~/.claude/settings.json:
+    - UserPromptSubmit -> `heartbeat --hook`: records the beat, then
+        * L4/L5: returns {"decision":"block","reason":...} — the prompt is REFUSED
+          at the platform level before Claude ever sees it.
+        * L3: returns a systemMessage throttle reminder (rate-limited).
+        * Long stretches (90/150 min), heavy days (4h+), late-night starts:
+          non-blocking systemMessage console alerts (rate-limited).
+    - SessionStart -> status summary injected as context so Claude knows the level.
+    - Stop -> silent heartbeat so blocks reflect full turns.
 
 Subcommands:
-  status            JSON verdict: index, level, instruction. Exit 0/5/10 (see below).
-  log-session       Record a work session (behavioural signal; may escalate level).
-  checkin           Structured self-report (drives 60% of the index).
-  defer             Park a task while throttled/locked:  defer --task "..."
-  parked            List the parking lot (use when de-escalating to resume work).
-  cooldown start    Self-imposed lockout:  cooldown start --reason "..."
-  cooldown clear    Exit ritual. L5-triggered cooldowns also need --plan "..."
-  override          L4 only, once per cooldown, logged, penalised.
-  history           Recent raw entries and audit events.
-  report            14-day markdown wellbeing report.
+  status | log-session | checkin | defer | parked | cooldown start/clear |
+  override | history | report | heartbeat [--hook] [--event NAME] |
+  hook install|uninstall|status
 
 State: ~/.burnout-guard/state.json (override with BURNOUT_GUARD_HOME).
-Exit codes: 0 = work may proceed (L0–L2), 5 = THROTTLED (L3), 10 = LOCKED (L4/L5),
-2 = usage error.
+Exit codes: 0 work may proceed (L0-L2), 5 THROTTLED (L3), 10 LOCKED (L4/L5), 2 usage.
+`heartbeat --hook` ALWAYS exits 0 (hook JSON carries the decision) and must never
+crash a prompt.
 """
 
 import argparse
@@ -42,9 +48,10 @@ from pathlib import Path
 
 HOME = Path(os.environ.get("BURNOUT_GUARD_HOME", Path.home() / ".burnout-guard"))
 STATE_FILE = HOME / "state.json"
+CLAUDE_SETTINGS = Path(os.environ.get("CLAUDE_SETTINGS_PATH",
+                                      Path.home() / ".claude" / "settings.json"))
 
 LEVELS = [
-    # (level, name, min_index, max_index)
     (0, "Flow",          0,  24),
     (1, "Watch",        25,  39),
     (2, "Friction",     40,  54),
@@ -54,32 +61,36 @@ LEVELS = [
 ]
 
 LEVEL_INSTRUCTIONS = {
-    0: "Normal operation. Log work sessions with `log-session`.",
-    1: "Normal operation, but surface the index and level once at the start of the "
-       "session. No restrictions.",
-    2: "Work proceeds. Name the main driver of the score, suggest one break or "
-       "adjustment, and invite a check-in if the basis is behaviour-only. Do not nag "
-       "more than once per session.",
-    3: "THROTTLED — single-task mode. Ask the user to pick ONE task; help with that "
-       "task only. Defer everything else with `defer --task`. Suggest a ~45 minute "
-       "time-box. Decline new projects and scope expansions until the level drops.",
-    4: "LOCKED — cooldown active. Decline all task work. Offer only: conversation, "
-       "status/history/report, deferring tasks to the parking lot, the exit ritual "
-       "(if timer elapsed), or ONE logged override for genuine emergencies.",
-    5: "HARD LOCKOUT — cooldown active, override DISABLED. Decline all task work. "
-       "Offer only: conversation, status/history/report, deferring tasks, and the "
-       "exit ritual (timer + check-in + written recovery plan). The only exception "
-       "is a genuine crisis/safety situation, which dissolves all lockout framing.",
+    0: "Normal operation.",
+    1: "Normal operation; surface the index and level once at session start.",
+    2: "Work proceeds. Name the score's main driver, suggest ONE adjustment, invite a "
+       "check-in if basis is behaviour-only. Max one nudge per session.",
+    3: "THROTTLED — single-task mode. One task only; defer the rest (`defer --task`). "
+       "Suggest a ~45-min time-box. Decline new projects until the level drops.",
+    4: "LOCKED — decline all task work. Permitted: conversation, status/history/report, "
+       "deferring tasks, exit ritual (if timer elapsed), ONE logged override.",
+    5: "HARD LOCKOUT — decline all task work; override DISABLED. Exit needs timer + "
+       "check-in + written recovery plan. Crisis/safety dissolves all of this.",
 }
 
-EXIT_INDEX_MAX = 54            # exit ritual requires index at or below this (top of L2)
-RECOVERY_PLAN_MIN_CHARS = 30   # required to clear an L5-triggered cooldown
-OVERRIDE_PENALTY = 8           # added to future indices until next L0/L1 check-in
+# Index thresholds & enforcement
+EXIT_INDEX_MAX = 54
+RECOVERY_PLAN_MIN_CHARS = 30
+OVERRIDE_PENALTY = 8
 LATE_NIGHT_START, LATE_NIGHT_END = 23, 5
+SELF_REPORT_WEIGHT, BEHAVIOUR_WEIGHT = 0.6, 0.4
+SEVERE_SELF_REPORT_FLOOR = 0.85
 
-SELF_REPORT_WEIGHT = 0.6
-BEHAVIOUR_WEIGHT = 0.4
-SEVERE_SELF_REPORT_FLOOR = 0.85   # index >= self_report * this
+# Attention-time model
+BLOCK_GAP_MIN = 15            # beats closer than this stitch into one block
+LONG_BLOCK_1_MIN = 90         # first "take a break" console alert
+LONG_BLOCK_2_MIN = 150        # stronger alert
+HEAVY_DAY_HOURS = 4           # daily active-hours alert
+ALERT_REPEAT_MIN = 45         # min minutes between repeats of the same alert
+THROTTLE_REMINDER_MIN = 30    # throttle systemMessage cadence
+
+# Behaviour score weights (trailing 7 days)
+W_VOLUME, W_NIGHT, W_STREAK, W_INTENSITY = 0.30, 0.25, 0.20, 0.25
 
 # ---------------------------------------------------------------- state io
 
@@ -94,14 +105,15 @@ def parse(ts: str) -> datetime:
 
 def default_state() -> dict:
     return {
-        "version": 2,
+        "version": 3,
         "created_at": iso(now()),
-        "sessions": [],
+        "blocks": [],          # [{start, end, beats, late_night}] continuous work blocks
+        "sessions": [],        # legacy/manual log-session entries (still honoured)
         "checkins": [],
-        "cooldown": None,       # {started_at, ends_at, trigger_index, trigger_level,
-                                #  reason, overrides: [], recovery_plan: None}
-        "parking_lot": [],      # [{ts, task}]
+        "cooldown": None,
+        "parking_lot": [],
         "override_penalty": 0,
+        "last_alerts": {},     # {alert_key: iso_ts} rate limiting
         "events": [],
     }
 
@@ -113,12 +125,16 @@ def load_state() -> dict:
     except json.JSONDecodeError:
         STATE_FILE.rename(STATE_FILE.with_suffix(".corrupt.json"))
         return default_state()
-    if state.get("version", 1) < 2:   # migrate v1 -> v2
+    v = state.get("version", 1)
+    if v < 2:
         state.setdefault("parking_lot", [])
         if state.get("cooldown"):
             state["cooldown"].setdefault("trigger_level", 4)
             state["cooldown"].setdefault("recovery_plan", None)
-        state["version"] = 2
+    if v < 3:
+        state.setdefault("blocks", [])
+        state.setdefault("last_alerts", {})
+        state["version"] = 3
     return state
 
 def save_state(state: dict) -> None:
@@ -131,44 +147,82 @@ def audit(state: dict, event_type: str, detail: str) -> None:
     state["events"].append({"ts": iso(now()), "type": event_type, "detail": detail})
     state["events"] = state["events"][-500:]
 
+# ---------------------------------------------------------------- attention
+
+def is_late(dt_local: datetime) -> bool:
+    return dt_local.hour >= LATE_NIGHT_START or dt_local.hour < LATE_NIGHT_END
+
+def record_beat(state: dict) -> dict:
+    """Stitch this moment into the current continuous block. Returns the live block."""
+    t = now()
+    blocks = state["blocks"]
+    if blocks and (t - parse(blocks[-1]["end"])) <= timedelta(minutes=BLOCK_GAP_MIN):
+        b = blocks[-1]
+        b["end"] = iso(t)
+        b["beats"] = b.get("beats", 1) + 1
+        b["late_night"] = b.get("late_night") or is_late(datetime.now())
+    else:
+        b = {"start": iso(t), "end": iso(t), "beats": 1,
+             "late_night": is_late(datetime.now())}
+        blocks.append(b)
+    state["blocks"] = blocks[-1000:]
+    return b
+
+def block_minutes(b: dict) -> float:
+    return (parse(b["end"]) - parse(b["start"])).total_seconds() / 60
+
+def behaviour_score(state: dict) -> dict:
+    """0-100 plus components, from blocks (+legacy sessions) over trailing 7 days."""
+    cutoff = now() - timedelta(days=7)
+    blocks = [b for b in state["blocks"] if parse(b["end"]) >= cutoff]
+    sessions = [s for s in state["sessions"] if parse(s["ts"]) >= cutoff]
+
+    daily_min: dict = {}
+    for b in blocks:
+        daily_min[parse(b["start"]).date()] = \
+            daily_min.get(parse(b["start"]).date(), 0) + block_minutes(b)
+    for s in sessions:                      # manual logs count as 30-min credits
+        daily_min[parse(s["ts"]).date()] = daily_min.get(parse(s["ts"]).date(), 0) + 30
+
+    avg_hours = (sum(daily_min.values()) / 60) / 7 if daily_min else 0
+    longest = max((block_minutes(b) for b in blocks), default=0)
+    late_n = sum(1 for b in blocks if b.get("late_night")) + \
+             sum(1 for s in sessions if s.get("late_night"))
+
+    days_active = set(daily_min)
+    streak, d = 0, now().date()
+    while d in days_active:
+        streak += 1
+        d -= timedelta(days=1)
+
+    def clamp01(x): return max(0.0, min(1.0, x))
+    volume = clamp01((avg_hours - 2) / 6) * 100          # 2h/day -> 0, 8h/day -> 100
+    intensity = clamp01((longest - 60) / 180) * 100      # 1h block -> 0, 4h -> 100
+    night = clamp01(late_n / 5) * 100                    # 5 late blocks/wk -> 100
+    grind = clamp01((streak - 4) / 6) * 100              # 5-day streak counts, 10 max
+
+    score = W_VOLUME * volume + W_NIGHT * night + W_STREAK * grind + W_INTENSITY * intensity
+    return {"score": round(min(100, score), 1),
+            "avg_hours_per_day": round(avg_hours, 2),
+            "longest_block_min": round(longest),
+            "late_night_blocks_7d": late_n,
+            "streak_days": streak}
+
 # ---------------------------------------------------------------- scoring
 
 def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def self_report_score(state: dict) -> float | None:
-    """0–100 from the most recent check-in within 72h. None if stale/absent."""
     if not state["checkins"]:
         return None
     last = state["checkins"][-1]
     if now() - parse(last["ts"]) > timedelta(hours=72):
         return None
-    raw = (
-        (last["exhaustion"] - 1) * 1.25 +
-        (last["detachment"] - 1) * 1.25 +
-        (5 - last["efficacy"]) * 1.0 +
-        (5 - last["sleep"]) * 0.75 +
-        (last["pressure"] - 1) * 0.75
-    )
-    return clamp(raw * 5.0, 0, 100)   # raw max 20 -> 100
-
-def behaviour_score(state: dict) -> float:
-    """0–100 from logged sessions over the trailing 7 days."""
-    cutoff = now() - timedelta(days=7)
-    recent = [s for s in state["sessions"] if parse(s["ts"]) >= cutoff]
-    if not recent:
-        return 0.0
-    per_day = len(recent) / 7.0
-    late = sum(1 for s in recent if s.get("late_night"))
-    days_active = {parse(s["ts"]).date() for s in recent}
-    streak, d = 0, now().date()
-    while d in days_active:
-        streak += 1
-        d -= timedelta(days=1)
-    volume = clamp((per_day - 2) / 6 * 100, 0, 100)
-    night = clamp(late / 5 * 100, 0, 100)
-    grind = clamp((streak - 4) / 6 * 100, 0, 100)
-    return clamp(0.4 * volume + 0.35 * night + 0.25 * grind, 0, 100)
+    raw = ((last["exhaustion"] - 1) * 1.25 + (last["detachment"] - 1) * 1.25 +
+           (5 - last["efficacy"]) * 1.0 + (5 - last["sleep"]) * 0.75 +
+           (last["pressure"] - 1) * 0.75)
+    return clamp(raw * 5.0, 0, 100)
 
 def level_for(index: float) -> tuple[int, str]:
     for lvl, name, lo, hi in reversed(LEVELS):
@@ -180,50 +234,36 @@ def compute_index(state: dict) -> dict:
     sr = self_report_score(state)
     bh = behaviour_score(state)
     if sr is None:
-        # Behaviour alone can warn (up to L3 Throttle) but never lock (L4+).
-        index = clamp(bh, 0, 64)
-        basis = "behaviour-only (no check-in in 72h; capped at L3 — check-in invited)"
+        index = clamp(bh["score"], 0, 64)   # behaviour alone can throttle, never lock
+        basis = "behaviour-only (no check-in in 72h; capped at L3 — invite a check-in)"
     else:
-        index = SELF_REPORT_WEIGHT * sr + BEHAVIOUR_WEIGHT * bh
+        index = SELF_REPORT_WEIGHT * sr + BEHAVIOUR_WEIGHT * bh["score"]
         index = max(index, sr * SEVERE_SELF_REPORT_FLOOR)
         basis = "blended (60% self-report, 40% behaviour; severe self-report floor)"
     index = clamp(index + state.get("override_penalty", 0), 0, 100)
     lvl, name = level_for(index)
-    return {
-        "index": round(index, 1),
-        "level": lvl,
-        "level_name": name,
-        "self_report": None if sr is None else round(sr, 1),
-        "behaviour": round(bh, 1),
-        "basis": basis,
-        "override_penalty": state.get("override_penalty", 0),
-    }
+    return {"index": round(index, 1), "level": lvl, "level_name": name,
+            "self_report": None if sr is None else round(sr, 1),
+            "behaviour": bh["score"], "behaviour_detail": bh,
+            "basis": basis, "override_penalty": state.get("override_penalty", 0)}
 
 def cooldown_hours_for(index: float, level: int) -> int:
-    if level >= 5:   # 36h at 85 -> 72h at 100
-        span = clamp((index - 85) / 15, 0, 1)
-        return int(round(36 + span * 36))
-    span = clamp((index - 65) / 19, 0, 1)   # 12h at 65 -> 36h at 84
-    return int(round(12 + span * 24))
+    if level >= 5:
+        return int(round(36 + clamp((index - 85) / 15, 0, 1) * 36))
+    return int(round(12 + clamp((index - 65) / 19, 0, 1) * 24))
 
 # ---------------------------------------------------------------- cooldown
 
 def start_cooldown(state: dict, index: float, level: int, reason: str) -> dict:
     hours = cooldown_hours_for(index, level)
-    state["cooldown"] = {
-        "started_at": iso(now()),
-        "ends_at": iso(now() + timedelta(hours=hours)),
-        "trigger_index": index,
-        "trigger_level": level,
-        "reason": reason,
-        "overrides": [],
-        "recovery_plan": None,
-    }
+    state["cooldown"] = {"started_at": iso(now()),
+                         "ends_at": iso(now() + timedelta(hours=hours)),
+                         "trigger_index": index, "trigger_level": level,
+                         "reason": reason, "overrides": [], "recovery_plan": None}
     audit(state, "cooldown_start", f"L{level} index={index} hours={hours} reason={reason}")
     return state["cooldown"]
 
 def maybe_escalate(state: dict, score: dict, source: str) -> None:
-    """Auto-start or upgrade a cooldown when the level reaches L4/L5."""
     lvl, idx = score["level"], score["index"]
     cd = state.get("cooldown")
     if lvl >= 4 and not cd:
@@ -238,53 +278,166 @@ def cooldown_status(state: dict) -> dict:
     remaining = parse(cd["ends_at"]) - now()
     timer_elapsed = remaining.total_seconds() <= 0
     lvl = cd.get("trigger_level", 4)
-    exit_req = (f"timer elapsed AND fresh check-in (2h) with index <= {EXIT_INDEX_MAX}"
-                + (" AND a written recovery plan (--plan)" if lvl >= 5 else ""))
-    return {
-        "locked": True,
-        "lock_level": lvl,
-        "started_at": cd["started_at"],
-        "ends_at": cd["ends_at"],
-        "timer_elapsed": timer_elapsed,
-        "remaining_human": "0h 0m" if timer_elapsed else
-            f"{int(remaining.total_seconds() // 3600)}h {int(remaining.total_seconds() % 3600 // 60)}m",
-        "trigger_index": cd["trigger_index"],
-        "reason": cd["reason"],
-        "override_available": lvl < 5 and len(cd.get("overrides", [])) == 0,
-        "overrides_used": len(cd.get("overrides", [])),
-        "exit_requires": exit_req,
-    }
+    return {"locked": True, "lock_level": lvl,
+            "started_at": cd["started_at"], "ends_at": cd["ends_at"],
+            "timer_elapsed": timer_elapsed,
+            "remaining_human": "0h 0m" if timer_elapsed else
+                f"{int(remaining.total_seconds() // 3600)}h {int(remaining.total_seconds() % 3600 // 60)}m",
+            "trigger_index": cd["trigger_index"], "reason": cd["reason"],
+            "override_available": lvl < 5 and len(cd.get("overrides", [])) == 0,
+            "overrides_used": len(cd.get("overrides", [])),
+            "exit_requires": f"timer elapsed AND fresh check-in (2h) with index <= {EXIT_INDEX_MAX}"
+                             + (" AND a written recovery plan (--plan)" if lvl >= 5 else "")}
+
+# ---------------------------------------------------------------- alerts
+
+def alert_due(state: dict, key: str, cooldown_min: int = ALERT_REPEAT_MIN) -> bool:
+    last = state["last_alerts"].get(key)
+    if last and now() - parse(last) < timedelta(minutes=cooldown_min):
+        return False
+    state["last_alerts"][key] = iso(now())
+    return True
+
+PASS_PREFIXES = ("bg:", "burnout:")   # deliberate-act prefix: always passes the hook
+
+def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
+                         prompt: str = "") -> dict:
+    """Returns hook-output JSON: a block decision, a systemMessage alert, or {}."""
+    # Deliberate-act passthrough: conversation, exit ritual, parking, emergencies.
+    # Claude still applies the level protocol (no task work at L4/L5) — this opens
+    # the conversational channel, not the workbench.
+    if cd["locked"] and prompt.strip().lower().startswith(PASS_PREFIXES):
+        lvl = cd["lock_level"]
+        return {"systemMessage": f"🧯 bg: channel open — L{lvl} protocol still applies "
+                                 "(conversation, status, parking, exit ritual, "
+                                 "emergencies; no task work).",
+                "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                    "additionalContext": f"Burnout Guard: L{lvl} lockout active; user "
+                        "opened the bg: channel. Follow the lockout protocol — "
+                        "conversation/status/parking/exit ritual yes, task work no. "
+                        "Crisis or distress dissolves all lockout framing."}}
+    # 0) Override grace window: enforcement pauses for 60 min after an L4 override.
+    grace = state["last_alerts"].get("override_grace_until")
+    if cd["locked"] and grace and now() < parse(grace):
+        return {"systemMessage": "🧯 Override grace active — lockout enforcement "
+                                 "resumes when the 60-minute window closes."}
+
+    # 1) Locked: hard-block the prompt at the platform level.
+    if cd["locked"]:
+        lock_lvl = cd["lock_level"]
+        if cd["timer_elapsed"]:
+            reason = (f"🧯 Burnout Guard — L{lock_lvl} cooldown timer has elapsed. "
+                      f"Exit ritual required: a fresh check-in scoring <= {EXIT_INDEX_MAX}"
+                      + (" plus a short written recovery plan." if lock_lvl >= 5 else ".")
+                      + " Start your message with `bg:` to run it, e.g. "
+                        "`bg: let's do the exit check-in`.")
+        else:
+            reason = (f"🧯 Burnout Guard — L{lock_lvl} "
+                      f"{'HARD LOCKOUT' if lock_lvl >= 5 else 'Lockout'} active. "
+                      f"{cd['remaining_human']} remaining (triggered at index "
+                      f"{cd['trigger_index']}). Task work is paused. You can still chat, "
+                      f"check status, or park tasks"
+                      + (". One logged override is available for genuine emergencies."
+                         if cd["override_available"] else
+                         "; no override at this level." if lock_lvl >= 5 else
+                         "; the override has been used.")
+                      + " Start any message with `bg:` to talk to Claude — that channel "
+                        "is ALWAYS open (venting, status, parking tasks, the exit "
+                        "ritual, and anything urgent or personal).")
+        return {"decision": "block", "reason": reason}
+
+    msgs = []
+    mins = block_minutes(block)
+    bd = score["behaviour_detail"]
+
+    # 2) Throttle reminder (rate-limited).
+    if score["level"] == 3 and alert_due(state, "throttle", THROTTLE_REMINDER_MIN):
+        msgs.append(f"🧯 Burnout Guard: index {score['index']} — L3 Throttle. "
+                    "Single-task mode: one thing at a time, ~45-min time-box; "
+                    "Claude will park the rest.")
+
+    # 3) Continuous-stretch alerts.
+    if mins >= LONG_BLOCK_2_MIN and alert_due(state, "block150"):
+        msgs.append(f"🧯 You've been at this {int(mins // 60)}h {int(mins % 60)}m "
+                    "without a real gap. Strong nudge: stand up, water, 10 minutes away. "
+                    "The code will keep.")
+    elif mins >= LONG_BLOCK_1_MIN and alert_due(state, "block90"):
+        msgs.append(f"🧯 {int(mins)} minutes continuous — good moment for a short break.")
+
+    # 4) Heavy-day alert.
+    today_min = sum(block_minutes(b) for b in state["blocks"]
+                    if parse(b["start"]).date() == now().date())
+    if today_min >= HEAVY_DAY_HOURS * 60 and alert_due(state, "heavyday", 120):
+        msgs.append(f"🧯 {today_min / 60:.1f}h of focused Claude work today. "
+                    "Worth deciding now when today ends.")
+
+    # 5) Late-night start.
+    if is_late(datetime.now()) and alert_due(state, "latenight", 120):
+        msgs.append("🧯 Late-night session logged. These weigh heavily in your burnout "
+                    "index — if this becomes a pattern, the level will climb.")
+
+    if msgs:
+        return {"systemMessage": " ".join(msgs)}
+    return {}
 
 # ---------------------------------------------------------------- commands
+
+def cmd_heartbeat(args):
+    """Called by Claude Code hooks on every prompt/turn. Must never crash a prompt."""
+    try:
+        try:
+            hook_input = json.loads(sys.stdin.read()) if not sys.stdin.isatty() else {}
+        except Exception:
+            hook_input = {}
+        state = load_state()
+        block = record_beat(state)
+        score = compute_index(state)
+        maybe_escalate(state, score, "heartbeat")
+        cd = cooldown_status(state)
+
+        if args.event == "session-start":
+            ctx = (f"Burnout Guard status: index {score['index']} — "
+                   f"L{score['level']} {score['level_name']}. "
+                   f"{LEVEL_INSTRUCTIONS[max(score['level'], cd['lock_level'] if cd['locked'] else 0)]}")
+            out = {"hookSpecificOutput": {"hookEventName": "SessionStart",
+                                          "additionalContext": ctx}}
+        elif args.event == "stop":
+            out = {}                      # silent: just extends the block
+        else:                             # user-prompt-submit (default)
+            prompt = hook_input.get("prompt", "") if isinstance(hook_input, dict) else ""
+            out = build_console_alerts(state, block, score, cd, prompt) if args.hook \
+                  else {"beat": True, "score": score, "cooldown": cd}
+        save_state(state)
+        print(json.dumps(out))
+    except Exception as e:
+        # Fail open: never break the user's prompt because of us.
+        print(json.dumps({}))
+        print(f"burnout-guard heartbeat error: {e}", file=sys.stderr)
+    sys.exit(0)
 
 def cmd_status(args):
     state = load_state()
     score = compute_index(state)
     cd = cooldown_status(state)
     if cd["locked"]:
-        effective = max(score["level"], cd["lock_level"], 4)
-        verdict, code = "LOCKED", 10
+        effective, verdict, code = max(score["level"], cd["lock_level"], 4), "LOCKED", 10
     elif score["level"] == 3:
         effective, verdict, code = 3, "THROTTLED", 5
     else:
         effective, verdict, code = score["level"], "UNLOCKED", 0
-    print(json.dumps({
-        "score": score,
-        "effective_level": effective,
-        "effective_level_name": dict((l, n) for l, n, *_ in LEVELS)[effective],
-        "cooldown": cd,
-        "parking_lot_size": len(state["parking_lot"]),
-        "verdict": verdict,
-        "instruction": LEVEL_INSTRUCTIONS[effective],
-    }, indent=2))
+    print(json.dumps({"score": score, "effective_level": effective,
+                      "effective_level_name": dict((l, n) for l, n, *_ in LEVELS)[effective],
+                      "cooldown": cd, "parking_lot_size": len(state["parking_lot"]),
+                      "verdict": verdict, "instruction": LEVEL_INSTRUCTIONS[effective]},
+                     indent=2))
     sys.exit(code)
 
 def cmd_log_session(args):
     state = load_state()
-    hour = datetime.now().hour
-    late = hour >= LATE_NIGHT_START or hour < LATE_NIGHT_END
+    late = is_late(datetime.now())
     state["sessions"].append({"ts": iso(now()), "late_night": late})
     state["sessions"] = state["sessions"][-1000:]
+    record_beat(state)
     audit(state, "session", f"late_night={late}")
     score = compute_index(state)
     maybe_escalate(state, score, "session log")
@@ -295,21 +448,17 @@ def cmd_log_session(args):
 def cmd_checkin(args):
     state = load_state()
     for field in ("exhaustion", "detachment", "efficacy", "sleep", "pressure"):
-        v = getattr(args, field)
-        if not 1 <= v <= 5:
+        if not 1 <= getattr(args, field) <= 5:
             print(f"error: --{field} must be 1-5", file=sys.stderr)
             sys.exit(2)
-    entry = {
-        "ts": iso(now()),
-        "exhaustion": args.exhaustion, "detachment": args.detachment,
-        "efficacy": args.efficacy, "sleep": args.sleep, "pressure": args.pressure,
-        "notes": args.notes or "",
-    }
+    entry = {"ts": iso(now()), "exhaustion": args.exhaustion,
+             "detachment": args.detachment, "efficacy": args.efficacy,
+             "sleep": args.sleep, "pressure": args.pressure, "notes": args.notes or ""}
     state["checkins"].append(entry)
     state["checkins"] = state["checkins"][-365:]
     score = compute_index(state)
     entry["index_at_checkin"] = score["index"]
-    if score["level"] <= 1:           # a calm check-in clears any override penalty
+    if score["level"] <= 1:
         state["override_penalty"] = 0
         score = compute_index(state)
     audit(state, "checkin", f"index={score['index']} L{score['level']}")
@@ -327,8 +476,8 @@ def cmd_defer(args):
     state["parking_lot"].append({"ts": iso(now()), "task": task})
     audit(state, "defer", task[:120])
     save_state(state)
-    print(json.dumps({"deferred": True, "parking_lot_size": len(state["parking_lot"]),
-                      "detail": "Parked. It will be waiting when the level drops."}, indent=2))
+    print(json.dumps({"deferred": True, "parking_lot_size": len(state["parking_lot"])},
+                     indent=2))
 
 def cmd_parked(args):
     state = load_state()
@@ -345,25 +494,25 @@ def cmd_cooldown(args):
     state = load_state()
     if args.action == "start":
         score = compute_index(state)
-        idx = max(score["index"], 65)
-        lvl = max(score["level"], 4)
-        start_cooldown(state, idx, lvl, args.reason or "manual start")
+        start_cooldown(state, max(score["index"], 65), max(score["level"], 4),
+                       args.reason or "manual start")
         save_state(state)
         print(json.dumps({"started": True, "cooldown": cooldown_status(state)}, indent=2))
         return
-    # clear
     cd = cooldown_status(state)
     if not cd["locked"]:
         print(json.dumps({"cleared": False, "detail": "no active cooldown"}, indent=2))
         return
     if not cd["timer_elapsed"]:
         print(json.dumps({"cleared": False,
-                          "detail": f"timer not elapsed — {cd['remaining_human']} remaining"}, indent=2))
+                          "detail": f"timer not elapsed — {cd['remaining_human']} remaining"},
+                         indent=2))
         sys.exit(10)
     fresh = state["checkins"] and (now() - parse(state["checkins"][-1]["ts"]) < timedelta(hours=2))
     if not fresh:
         print(json.dumps({"cleared": False,
-                          "detail": "exit check-in required (within last 2h) before clearing"}, indent=2))
+                          "detail": "exit check-in required (within last 2h) before clearing"},
+                         indent=2))
         sys.exit(10)
     score = compute_index(state)
     if score["index"] > EXIT_INDEX_MAX:
@@ -378,18 +527,18 @@ def cmd_cooldown(args):
         plan = (args.plan or "").strip()
         if len(plan) < RECOVERY_PLAN_MIN_CHARS:
             print(json.dumps({"cleared": False,
-                              "detail": f"L5 exit requires --plan of >= {RECOVERY_PLAN_MIN_CHARS} chars: "
-                                        "what changes this week so this doesn't recur?"}, indent=2))
+                              "detail": f"L5 exit requires --plan >= {RECOVERY_PLAN_MIN_CHARS} chars: "
+                                        "what changes this week so this doesn't recur?"},
+                             indent=2))
             sys.exit(10)
         state["cooldown"]["recovery_plan"] = plan
         audit(state, "recovery_plan", plan[:200])
     audit(state, "cooldown_clear", f"exit index={score['index']}")
     state["cooldown"] = None
     save_state(state)
-    out = {"cleared": True, "score": score,
-           "parking_lot_size": len(state["parking_lot"])}
+    out = {"cleared": True, "score": score, "parking_lot_size": len(state["parking_lot"])}
     if state["parking_lot"]:
-        out["detail"] = "Parking lot has items — offer to resume them one at a time."
+        out["detail"] = "Parking lot has items — offer them back one at a time."
     print(json.dumps(out, indent=2))
 
 def cmd_override(args):
@@ -400,43 +549,43 @@ def cmd_override(args):
         return
     if cd.get("trigger_level", 4) >= 5:
         print(json.dumps({"override": False,
-                          "detail": "Hard Lockout (L5): overrides are disabled by design. "
-                                    "Crisis/safety situations are handled in conversation, "
-                                    "not via override."}, indent=2))
+                          "detail": "Hard Lockout (L5): overrides are disabled by design."},
+                         indent=2))
         sys.exit(10)
     if len(cd.get("overrides", [])) >= 1:
         print(json.dumps({"override": False,
-                          "detail": "override already used for this cooldown — lockout stands"}, indent=2))
+                          "detail": "override already used for this cooldown"}, indent=2))
         sys.exit(10)
     if not args.reason or len(args.reason.strip()) < 15:
-        print("error: --reason of at least 15 characters is required (it is logged)", file=sys.stderr)
+        print("error: --reason of at least 15 characters required (it is logged)",
+              file=sys.stderr)
         sys.exit(2)
     cd["overrides"].append({"ts": iso(now()), "reason": args.reason.strip()})
     state["override_penalty"] = state.get("override_penalty", 0) + OVERRIDE_PENALTY
+    # Grace window: next prompts within 60 min won't be hard-blocked by the hook.
+    state["last_alerts"]["override_grace_until"] = iso(now() + timedelta(minutes=60))
     audit(state, "override", args.reason.strip())
     save_state(state)
     print(json.dumps({"override": True,
-                      "detail": "One-time pass for THIS task only; lockout resumes after. "
-                                f"+{OVERRIDE_PENALTY} penalty until the next calm (L0/L1) check-in."},
+                      "detail": "One-time pass: hook enforcement pauses for 60 minutes "
+                                "for THIS task, then the lockout resumes. "
+                                f"+{OVERRIDE_PENALTY} penalty until next calm check-in."},
                      indent=2))
 
 def cmd_history(args):
     state = load_state()
-    print(json.dumps({
-        "recent_checkins": state["checkins"][-args.n:],
-        "recent_sessions": state["sessions"][-args.n:],
-        "recent_events": state["events"][-args.n:],
-        "parking_lot": state["parking_lot"],
-    }, indent=2))
+    print(json.dumps({"recent_checkins": state["checkins"][-args.n:],
+                      "recent_blocks": state["blocks"][-args.n:],
+                      "recent_events": state["events"][-args.n:],
+                      "parking_lot": state["parking_lot"]}, indent=2))
 
 def cmd_report(args):
     state = load_state()
     score = compute_index(state)
     cd = cooldown_status(state)
+    bd = score["behaviour_detail"]
     cutoff = now() - timedelta(days=14)
-    sessions = [s for s in state["sessions"] if parse(s["ts"]) >= cutoff]
     checkins = [c for c in state["checkins"] if parse(c["ts"]) >= cutoff]
-    late = sum(1 for s in sessions if s.get("late_night"))
     lockouts = [e for e in state["events"]
                 if e["type"] == "cooldown_start" and parse(e["ts"]) >= cutoff]
     lines = [
@@ -444,28 +593,91 @@ def cmd_report(args):
         f"\n**Current index:** {score['index']} — **L{score['level']} {score['level_name']}**",
         f"**Basis:** {score['basis']}",
         f"**Lockout:** {'ACTIVE (L' + str(cd['lock_level']) + ') until ' + cd['ends_at'] if cd['locked'] else 'none'}",
-        f"\n## Behaviour\n- Sessions: {len(sessions)} ({late} late-night)",
-        f"- Behaviour score: {score['behaviour']}/100",
-        f"\n## Self-report\n- Check-ins: {len(checkins)}",
+        f"\n## Attention (trailing 7 days)",
+        f"- Average focused hours/day: {bd['avg_hours_per_day']}",
+        f"- Longest continuous stretch: {bd['longest_block_min']} min",
+        f"- Late-night blocks: {bd['late_night_blocks_7d']}",
+        f"- Active-day streak: {bd['streak_days']}",
+        f"- Behaviour score: {bd['score']}/100",
+        f"\n## Self-report\n- Check-ins (14d): {len(checkins)}",
     ]
     if checkins:
         last = checkins[-1]
         lines.append(f"- Latest ({last['ts']}): exhaustion {last['exhaustion']}/5, "
                      f"detachment {last['detachment']}/5, efficacy {last['efficacy']}/5, "
                      f"sleep {last['sleep']}/5, pressure {last['pressure']}/5")
-        if last.get("notes"):
-            lines.append(f"- Notes: {last['notes']}")
-    lines += [
-        f"\n## Enforcement\n- Lockouts triggered (14d): {len(lockouts)}",
-        f"- Parking lot: {len(state['parking_lot'])} item(s)",
-        f"- Override penalty in effect: +{state.get('override_penalty', 0)}",
-        f"\n## Audit\n- Events logged: {len(state['events'])}",
-    ]
+    lines += [f"\n## Enforcement\n- Lockouts triggered (14d): {len(lockouts)}",
+              f"- Parking lot: {len(state['parking_lot'])} item(s)",
+              f"- Override penalty in effect: +{state.get('override_penalty', 0)}",
+              f"\n## Audit\n- Events logged: {len(state['events'])}"]
     if len(lockouts) >= 2:
-        lines.append("\n> Two or more lockouts in 14 days. The pattern, not the timer, "
-                     "is the signal — consider a conversation with a GP or occupational "
-                     "health rather than another cooldown cycle.")
+        lines.append("\n> Two or more lockouts in 14 days. The pattern, not the timer, is "
+                     "the signal — consider a conversation with a GP or occupational health.")
     print("\n".join(lines))
+
+# ---------------------------------------------------------------- hook mgmt
+
+HOOK_MARKER = "burnout.py heartbeat"
+
+def hook_entries(script: str) -> dict:
+    return {
+        "UserPromptSubmit": [{"hooks": [{"type": "command",
+            "command": f"python3 {script} heartbeat --hook"}]}],
+        "SessionStart": [{"hooks": [{"type": "command",
+            "command": f"python3 {script} heartbeat --hook --event session-start"}]}],
+        "Stop": [{"hooks": [{"type": "command",
+            "command": f"python3 {script} heartbeat --hook --event stop"}]}],
+    }
+
+def cmd_hook(args):
+    script = str(Path(__file__).resolve())
+    settings_path = CLAUDE_SETTINGS
+    settings = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text())
+        except json.JSONDecodeError:
+            print(f"error: {settings_path} is not valid JSON — fix it first", file=sys.stderr)
+            sys.exit(2)
+
+    hooks = settings.get("hooks", {})
+    installed = any(HOOK_MARKER in json.dumps(v) for v in hooks.values())
+
+    if args.action == "status":
+        print(json.dumps({"settings_path": str(settings_path),
+                          "installed": installed, "script": script}, indent=2))
+        return
+
+    if args.action == "uninstall":
+        for event in list(hooks):
+            hooks[event] = [m for m in hooks[event]
+                            if HOOK_MARKER not in json.dumps(m)]
+            if not hooks[event]:
+                del hooks[event]
+        settings["hooks"] = hooks
+        settings_path.write_text(json.dumps(settings, indent=2))
+        print(json.dumps({"uninstalled": True}, indent=2))
+        return
+
+    # install
+    if settings_path.exists():
+        backup = settings_path.with_suffix(f".json.bak-{now().strftime('%Y%m%d%H%M%S')}")
+        backup.write_text(settings_path.read_text())
+    if installed:
+        cmd_hook(argparse.Namespace(action="uninstall"))   # refresh paths
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        hooks = settings.get("hooks", {})
+    for event, matchers in hook_entries(script).items():
+        hooks.setdefault(event, []).extend(matchers)
+    settings["hooks"] = hooks
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text(json.dumps(settings, indent=2))
+    print(json.dumps({"installed": True, "settings_path": str(settings_path),
+                      "events": list(hook_entries(script)),
+                      "detail": "Restart Claude Code (or /hooks to verify). "
+                                "Prompts now heartbeat; L4/L5 hard-block; console "
+                                "alerts on long stretches, heavy days, late nights."},
+                     indent=2))
 
 # ---------------------------------------------------------------- main
 
@@ -477,11 +689,20 @@ def main():
     sub.add_parser("status").set_defaults(fn=cmd_status)
     sub.add_parser("log-session").set_defaults(fn=cmd_log_session)
 
+    hb = sub.add_parser("heartbeat")
+    hb.add_argument("--hook", action="store_true",
+                    help="emit Claude Code hook JSON (block/systemMessage)")
+    hb.add_argument("--event", choices=["prompt", "session-start", "stop"],
+                    default="prompt")
+    hb.set_defaults(fn=cmd_heartbeat)
+
+    hk = sub.add_parser("hook")
+    hk.add_argument("action", choices=["install", "uninstall", "status"])
+    hk.set_defaults(fn=cmd_hook)
+
     ci = sub.add_parser("checkin")
-    for f, h in [("exhaustion", "1=fresh 5=running on fumes"),
-                 ("detachment", "1=engaged 5=checked out"),
-                 ("efficacy", "1=useless 5=on top of it"),
-                 ("sleep", "1=terrible 5=great"),
+    for f, h in [("exhaustion", "1=fresh 5=fumes"), ("detachment", "1=engaged 5=checked out"),
+                 ("efficacy", "1=useless 5=on top of it"), ("sleep", "1=terrible 5=great"),
                  ("pressure", "1=light 5=crushing")]:
         ci.add_argument(f"--{f}", type=int, required=True, help=h)
     ci.add_argument("--notes", type=str, default="")
@@ -498,8 +719,7 @@ def main():
     cd = sub.add_parser("cooldown")
     cd.add_argument("action", choices=["start", "clear"])
     cd.add_argument("--reason", type=str, default="")
-    cd.add_argument("--plan", type=str, default="",
-                    help="Recovery plan, required to clear an L5 cooldown")
+    cd.add_argument("--plan", type=str, default="")
     cd.set_defaults(fn=cmd_cooldown)
 
     ov = sub.add_parser("override")
