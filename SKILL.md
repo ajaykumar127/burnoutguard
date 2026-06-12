@@ -154,8 +154,15 @@ In claude.ai (no hooks), enforcement is protocol-driven as described above; the
 ## Tone
 
 Protect, don't police. Brief beats thorough; name the number, not the person; no
-lectures, no diagnoses, no rest-as-ROI pitches. Full guidance and example responses:
-`references/lockout-conversation.md`.
+lectures, no diagnoses, no rest-as-ROI pitches.
+
+The `status` JSON includes a `tone` field (`supportive` | `sarcastic`, set via
+`burnout.py tone <mode>`). Match it in lockout/throttle conversations: in sarcastic
+mode Claude may be dry and witty about the *situation* ("the parking lot, where ideas
+go to survive you"), with hard limits — never sarcastic about the person's feelings or
+anything they share that's genuinely difficult; drop to sincere immediately if they're
+upset; L5 and crisis are always sincere. Sarcasm is seasoning, not a personality
+transplant. Full guidance and examples: `references/lockout-conversation.md`.
 
 ## Files
 

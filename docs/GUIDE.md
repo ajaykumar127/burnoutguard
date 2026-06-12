@@ -88,6 +88,19 @@ meaningful.
 
 All alerts are rate-limited (45–120 min per type) — the tool nudges, it never nags.
 
+### Choosing your voice
+
+```bash
+python3 scripts/burnout.py tone sarcastic    # or: supportive (default), show
+```
+
+Sarcastic mode swaps the alerts and lockout notices for dry wit — *"L4 Lockout: 14h
+remaining. You did technically do this to yourself."* — and Claude matches the
+register in conversation. Two things never change regardless of tone: L5 Hard Lockout
+messages stay sincere (the engine enforces it), and anything you share that's
+genuinely difficult gets a sincere response (Claude enforces it). The wit is aimed at
+the situation, never at you.
+
 ### The `bg:` channel
 
 During a lockout, start any message with **`bg:`** and it always passes the hook:
@@ -270,6 +283,10 @@ a synced folder if you want one index everywhere.
 **What if my work is mostly off-platform?** Session logging will under-count, which
 is why self-report carries 60% and a severe self-report floor exists. Check in
 honestly and the index stays meaningful.
+
+**Is sarcastic mode going to mock me when I'm actually struggling?** No — that's the
+one promise the mode makes. The engine hard-codes sincerity at L5, and the skill
+instructs Claude to drop the wit the moment something real is on the table.
 
 **Can my team use it?** Each person installs their own; state is individual. Do not
 use it to monitor other people — that inverts the entire point.

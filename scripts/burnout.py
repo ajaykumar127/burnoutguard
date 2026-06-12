@@ -106,6 +106,7 @@ def parse(ts: str) -> datetime:
 def default_state() -> dict:
     return {
         "version": 3,
+        "config": {"tone": "supportive"},
         "created_at": iso(now()),
         "blocks": [],          # [{start, end, beats, late_night}] continuous work blocks
         "sessions": [],        # legacy/manual log-session entries (still honoured)
@@ -134,7 +135,8 @@ def load_state() -> dict:
     if v < 3:
         state.setdefault("blocks", [])
         state.setdefault("last_alerts", {})
-        state["version"] = 3
+    state.setdefault("config", {"tone": "supportive"})
+    state["version"] = 3
     return state
 
 def save_state(state: dict) -> None:
@@ -300,6 +302,85 @@ def alert_due(state: dict, key: str, cooldown_min: int = ALERT_REPEAT_MIN) -> bo
 
 PASS_PREFIXES = ("bg:", "burnout:")   # deliberate-act prefix: always passes the hook
 
+def tone_of(state: dict) -> str:
+    return state.get("config", {}).get("tone", "supportive")
+
+# Two voices, one engine. Sarcastic mode is opt-in (`burnout.py tone sarcastic`)
+# and deliberately softens at L5 and never touches crisis territory — wit about
+# the situation, never about the person's feelings.
+MSG = {
+    "block90": {
+        "supportive": "🧯 {mins} minutes continuous — good moment for a short break.",
+        "sarcastic":  "🧯 {mins} minutes straight. The bug will still be there after "
+                      "you blink. Wild concept, I know: a break.",
+    },
+    "block150": {
+        "supportive": "🧯 You've been at this {h}h {m}m without a real gap. Strong "
+                      "nudge: stand up, water, 10 minutes away. The code will keep.",
+        "sarcastic":  "🧯 {h}h {m}m without a gap. At this point the chair legally "
+                      "owns you. Stand up — give gravity a win.",
+    },
+    "heavyday": {
+        "supportive": "🧯 {hours}h of focused Claude work today. Worth deciding now "
+                      "when today ends.",
+        "sarcastic":  "🧯 {hours}h of focused work today. Bold strategy. Have you "
+                      "considered scheduling the part where you stop?",
+    },
+    "latenight": {
+        "supportive": "🧯 Late-night session logged. These weigh heavily in your "
+                      "burnout index — if this becomes a pattern, the level will climb.",
+        "sarcastic":  "🧯 Ah, the late-night session — famously when humanity's best "
+                      "decisions get made. Noted on your permanent record "
+                      "(the burnout index).",
+    },
+    "throttle": {
+        "supportive": "🧯 Burnout Guard: index {index} — L3 Throttle. Single-task "
+                      "mode: one thing at a time, ~45-min time-box; Claude will park "
+                      "the rest.",
+        "sarcastic":  "🧯 Index {index} — L3 Throttle. One task. Singular. I know, "
+                      "devastating. Everything else goes to the parking lot, where "
+                      "ideas go to survive you.",
+    },
+    "lock": {
+        "supportive": "🧯 Burnout Guard — L{lvl} {name} active. {remaining} remaining "
+                      "(triggered at index {idx}). Task work is paused. You can still "
+                      "chat, check status, or park tasks{override}. Start any message "
+                      "with `bg:` to talk to Claude — that channel is ALWAYS open "
+                      "(venting, status, parking tasks, the exit ritual, and anything "
+                      "urgent or personal).",
+        "sarcastic":  "🧯 L{lvl} {name}: {remaining} remaining. You did technically do "
+                      "this to yourself (index {idx}){override}. Complaints department "
+                      "is open — start any message with `bg:` and Claude will listen "
+                      "to all of them. That channel always works, including for "
+                      "anything actually serious.",
+    },
+    "timer_done": {
+        "supportive": "🧯 Burnout Guard — L{lvl} cooldown timer has elapsed. Exit "
+                      "ritual required: a fresh check-in scoring <= {exitmax}{plan}. "
+                      "Start your message with `bg:` to run it, e.g. `bg: let's do "
+                      "the exit check-in`.",
+        "sarcastic":  "🧯 Timer's done — congratulations on surviving rest. One "
+                      "formality left: an exit check-in scoring <= {exitmax}{plan}. "
+                      "Type `bg: let's do the exit check-in` and prove it.",
+    },
+    "bg_open": {
+        "supportive": "🧯 bg: channel open — L{lvl} protocol still applies "
+                      "(conversation, status, parking, exit ritual, emergencies; "
+                      "no task work).",
+        "sarcastic":  "🧯 bg: channel open. Talk away — but the workbench stays "
+                      "locked (L{lvl}), and no, rephrasing the task as a fun "
+                      "hypothetical doesn't count.",
+    },
+}
+
+def msg(state: dict, key: str, **kw) -> str:
+    t = tone_of(state)
+    # L5 always softens back to supportive phrasing for lock/timer messages —
+    # sarcasm has a floor.
+    if key in ("lock", "timer_done") and kw.get("lvl", 0) >= 5:
+        t = "supportive"
+    return MSG[key][t].format(**kw)
+
 def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
                          prompt: str = "") -> dict:
     """Returns hook-output JSON: a block decision, a systemMessage alert, or {}."""
@@ -308,9 +389,7 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
     # the conversational channel, not the workbench.
     if cd["locked"] and prompt.strip().lower().startswith(PASS_PREFIXES):
         lvl = cd["lock_level"]
-        return {"systemMessage": f"🧯 bg: channel open — L{lvl} protocol still applies "
-                                 "(conversation, status, parking, exit ritual, "
-                                 "emergencies; no task work).",
+        return {"systemMessage": msg(state, "bg_open", lvl=lvl),
                 "hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
                     "additionalContext": f"Burnout Guard: L{lvl} lockout active; user "
                         "opened the bg: channel. Follow the lockout protocol — "
@@ -326,24 +405,17 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
     if cd["locked"]:
         lock_lvl = cd["lock_level"]
         if cd["timer_elapsed"]:
-            reason = (f"🧯 Burnout Guard — L{lock_lvl} cooldown timer has elapsed. "
-                      f"Exit ritual required: a fresh check-in scoring <= {EXIT_INDEX_MAX}"
-                      + (" plus a short written recovery plan." if lock_lvl >= 5 else ".")
-                      + " Start your message with `bg:` to run it, e.g. "
-                        "`bg: let's do the exit check-in`.")
+            reason = msg(state, "timer_done", lvl=lock_lvl, exitmax=EXIT_INDEX_MAX,
+                         plan=(" plus a short written recovery plan" if lock_lvl >= 5 else ""))
         else:
-            reason = (f"🧯 Burnout Guard — L{lock_lvl} "
-                      f"{'HARD LOCKOUT' if lock_lvl >= 5 else 'Lockout'} active. "
-                      f"{cd['remaining_human']} remaining (triggered at index "
-                      f"{cd['trigger_index']}). Task work is paused. You can still chat, "
-                      f"check status, or park tasks"
-                      + (". One logged override is available for genuine emergencies."
-                         if cd["override_available"] else
-                         "; no override at this level." if lock_lvl >= 5 else
-                         "; the override has been used.")
-                      + " Start any message with `bg:` to talk to Claude — that channel "
-                        "is ALWAYS open (venting, status, parking tasks, the exit "
-                        "ritual, and anything urgent or personal).")
+            override_txt = (". One logged override is available for genuine emergencies"
+                            if cd["override_available"] else
+                            "; no override at this level" if lock_lvl >= 5 else
+                            "; the override has been used")
+            reason = msg(state, "lock", lvl=lock_lvl,
+                         name="Hard Lockout" if lock_lvl >= 5 else "Lockout",
+                         remaining=cd["remaining_human"], idx=cd["trigger_index"],
+                         override=override_txt)
         return {"decision": "block", "reason": reason}
 
     msgs = []
@@ -352,29 +424,23 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
 
     # 2) Throttle reminder (rate-limited).
     if score["level"] == 3 and alert_due(state, "throttle", THROTTLE_REMINDER_MIN):
-        msgs.append(f"🧯 Burnout Guard: index {score['index']} — L3 Throttle. "
-                    "Single-task mode: one thing at a time, ~45-min time-box; "
-                    "Claude will park the rest.")
+        msgs.append(msg(state, "throttle", index=score["index"]))
 
     # 3) Continuous-stretch alerts.
     if mins >= LONG_BLOCK_2_MIN and alert_due(state, "block150"):
-        msgs.append(f"🧯 You've been at this {int(mins // 60)}h {int(mins % 60)}m "
-                    "without a real gap. Strong nudge: stand up, water, 10 minutes away. "
-                    "The code will keep.")
+        msgs.append(msg(state, "block150", h=int(mins // 60), m=int(mins % 60)))
     elif mins >= LONG_BLOCK_1_MIN and alert_due(state, "block90"):
-        msgs.append(f"🧯 {int(mins)} minutes continuous — good moment for a short break.")
+        msgs.append(msg(state, "block90", mins=int(mins)))
 
     # 4) Heavy-day alert.
     today_min = sum(block_minutes(b) for b in state["blocks"]
                     if parse(b["start"]).date() == now().date())
     if today_min >= HEAVY_DAY_HOURS * 60 and alert_due(state, "heavyday", 120):
-        msgs.append(f"🧯 {today_min / 60:.1f}h of focused Claude work today. "
-                    "Worth deciding now when today ends.")
+        msgs.append(msg(state, "heavyday", hours=f"{today_min / 60:.1f}"))
 
     # 5) Late-night start.
     if is_late(datetime.now()) and alert_due(state, "latenight", 120):
-        msgs.append("🧯 Late-night session logged. These weigh heavily in your burnout "
-                    "index — if this becomes a pattern, the level will climb.")
+        msgs.append(msg(state, "latenight"))
 
     if msgs:
         return {"systemMessage": " ".join(msgs)}
@@ -428,7 +494,8 @@ def cmd_status(args):
     print(json.dumps({"score": score, "effective_level": effective,
                       "effective_level_name": dict((l, n) for l, n, *_ in LEVELS)[effective],
                       "cooldown": cd, "parking_lot_size": len(state["parking_lot"]),
-                      "verdict": verdict, "instruction": LEVEL_INSTRUCTIONS[effective]},
+                      "verdict": verdict, "tone": tone_of(state),
+                      "instruction": LEVEL_INSTRUCTIONS[effective]},
                      indent=2))
     sys.exit(code)
 
@@ -615,6 +682,23 @@ def cmd_report(args):
                      "the signal — consider a conversation with a GP or occupational health.")
     print("\n".join(lines))
 
+def cmd_tone(args):
+    state = load_state()
+    if args.mode == "show":
+        print(json.dumps({"tone": tone_of(state)}, indent=2))
+        return
+    state.setdefault("config", {})["tone"] = args.mode
+    audit(state, "tone", args.mode)
+    save_state(state)
+    samples = {k: MSG[k][args.mode if args.mode in MSG[k] else "supportive"]
+               for k in ("block90", "lock")}
+    print(json.dumps({"tone": args.mode,
+                      "detail": "Applies to console alerts and lockout notices. "
+                                "Sarcasm softens automatically at L5 and never "
+                                "applies to crisis or distress — wit about the "
+                                "situation, never about the person.",
+                      "sample": samples}, indent=2))
+
 # ---------------------------------------------------------------- hook mgmt
 
 HOOK_MARKER = "burnout.py heartbeat"
@@ -725,6 +809,10 @@ def main():
     ov = sub.add_parser("override")
     ov.add_argument("--reason", type=str, required=True)
     ov.set_defaults(fn=cmd_override)
+
+    tn = sub.add_parser("tone")
+    tn.add_argument("mode", choices=["supportive", "sarcastic", "show"])
+    tn.set_defaults(fn=cmd_tone)
 
     hi = sub.add_parser("history")
     hi.add_argument("-n", type=int, default=10)

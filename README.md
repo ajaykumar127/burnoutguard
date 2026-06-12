@@ -109,6 +109,7 @@ burnout.py parked                 # list parked tasks
 burnout.py cooldown start --reason "self-imposed rest day"
 burnout.py cooldown clear [--plan "..."]    # exit ritual; --plan required after L5
 burnout.py override --reason "..."          # L4 only, once, logged, penalised
+burnout.py tone sarcastic         # opt-in dry wit ("supportive" to revert, "show" to check)
 burnout.py report                 # 14-day wellbeing report
 ```
 
@@ -140,6 +141,9 @@ burnout-guard/
 - **Graduated, not binary** — the right response to index 47 is a sentence, not a wall.
 - **Friction on overrides, prohibition at the top.**
 - **Protect, don't police** — brief, warm, no lectures, no diagnoses, no rest-as-ROI.
+- **Sarcasm with a floor** — opt-in dry wit (`tone sarcastic`): *"100 minutes
+  straight. The bug will still be there after you blink. Wild concept, I know: a
+  break."* Automatically softens at L5 and never touches genuine distress.
 
 ## Not a medical device
 

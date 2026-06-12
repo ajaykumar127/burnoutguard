@@ -1,5 +1,16 @@
 # Changelog
 
+## v3.1.0 — 2026-06-12
+
+**Tone modes.** `burnout.py tone sarcastic|supportive|show`.
+
+- Full two-voice message catalogue for all console alerts, lockout notices,
+  throttle reminders, and the bg: channel acknowledgement
+- Claude matches the configured register in lockout/throttle conversations
+- Guardrails: sarcasm targets the situation never the person, auto-softens to
+  sincere at L5 (engine-enforced), and drops instantly for genuine distress
+  (skill-enforced); `status` now exposes the active tone
+
 ## v3.0.0 — 2026-06-12
 
 **Attention-time measurement + Claude Code console integration.**
