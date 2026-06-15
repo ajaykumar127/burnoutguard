@@ -52,6 +52,33 @@ disabled. `burnout.py report` now renders a 14-day focus **sparkline** and a 7×
 **hour-of-day × day-of-week heatmap** so you can actually see where your focus is
 landing, plus all-time records: longest sprint and longest active-day streak.
 
+## Personal calibration + pre-commitment contracts
+
+v4 rejects the "pick a profile" model that other wellbeing tools default to.
+Profiles are a loophole — they let users argue the threshold down at exactly the
+wrong moment. Instead:
+
+- **Personal baseline.** After 14 days of observed activity, alert thresholds are
+  *your* p75/p90, clamped to absolute floors (60/120 min long-block, 3h heavy day)
+  so a couch-potato baseline can't disable protection, and ceilings (150/300 min,
+  8h) so a marathon baseline still has a real cap. Marathon user gets alerts at
+  their 90th percentile; recovery user at theirs. No profile to pick.
+- **Contracts (one-way ratchet).** Pre-commit to a stricter version at calm time:
+  `burnout.py contract set --lockout-index 60 --stop-by 22`. Tightening applies
+  instantly. *Loosening* (or `contract clear`) queues for **7 days** before taking
+  effect — designed specifically against in-the-moment renegotiation
+  (Beeminder/Stickk lineage). Configurability is a one-way ratchet *toward*
+  protection only.
+- **Daily pulse.** `burnout.py pulse 3 --note "..."` is a 3-second 1-item burnout
+  reading (West et al.'s validated single-item measure). Smooths the self-report
+  curve and lifts the behaviour-only L3 cap when fresh. Doesn't replace the full
+  5-item check-in — it complements it.
+- **Sustainable rhythm streak.** Replaces grind streak as the goal: consecutive
+  days with work AND no over-long block AND no late-night block. The rhythm we
+  actually want to grow.
+- **Preview mode.** First 7 days from install, L4/L5 surface as warnings instead
+  of platform-blocking. Day-one users meet the system gradually.
+
 ## Real enforcement + console alerts in Claude Code
 
 ```bash
@@ -111,14 +138,18 @@ burnout.py status                 # the verdict — exit 0 (L0–L2) / 5 (Thrott
 burnout.py hook install           # wire heartbeats + alerts + enforcement into Claude Code
 burnout.py heartbeat --hook       # (called by hooks) record beat, emit alerts/blocks
 burnout.py log-session            # manual behavioural signal (claude.ai surfaces)
+burnout.py pulse 3 --note "..."   # daily 1-item burnout reading (1=fresh, 5=fumes)
 burnout.py checkin --exhaustion 3 --detachment 2 --efficacy 4 --sleep 2 --pressure 4
+burnout.py contract set --lockout-index 60 --stop-by 22 --max-daily-hours 4
+burnout.py contract show          # current contract + effective + resolved thresholds
+burnout.py contract clear         # 7-day cooling-off if it was tightening protection
 burnout.py defer --task "..."     # parking lot (L3+)
 burnout.py parked                 # list parked tasks
 burnout.py cooldown start --reason "self-imposed rest day"
 burnout.py cooldown clear [--plan "..."]    # exit ritual; --plan required after L5
 burnout.py override --reason "..."          # L4 only, once, logged, penalised
 burnout.py tone sarcastic         # opt-in dry wit ("supportive" to revert, "show" to check)
-burnout.py report                 # 14-day wellbeing report
+burnout.py report                 # 14-day wellbeing report (with sparkline + heatmap)
 ```
 
 Python 3.10+ stdlib only. State: `~/.burnout-guard/state.json` — local, never

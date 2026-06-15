@@ -80,6 +80,46 @@ python3 scripts/burnout.py checkin \
 Show the resulting index and level plainly. If it lands L4/L5 the script auto-starts
 the cooldown — deliver that news using `references/lockout-conversation.md`.
 
+## Daily pulse (lighter than a check-in)
+
+A 1-item daily reading (1=fresh, 5=fumes) the user can drop in 3 seconds:
+
+```bash
+python3 scripts/burnout.py pulse 3 --note "tired but okay"
+```
+
+Offer it instead of a full check-in when the user signals mild strain mid-task or
+when they haven't checked in for a couple of days. A fresh pulse (≤24h) is enough
+to lift the behaviour-only L3 cap; the full check-in still drives the most accurate
+index.
+
+## Contracts (pre-commitment, one-way ratchet)
+
+The user can pre-commit to a stricter version of the system at calm time:
+
+```bash
+python3 scripts/burnout.py contract set --lockout-index 60 --stop-by 22
+```
+
+Tightening (lower lockout, earlier stop, fewer max hours) applies instantly.
+*Loosening* — including `contract clear` — queues for **7 days** before taking
+effect. This is intentional: in-the-moment renegotiation is exactly what the
+contract exists to prevent. If the user asks you to make Burnout Guard less strict
+mid-session, point them to `contract` and explain the cooling-off — don't help them
+work around it. If they want to *strengthen* their commitment, that's instant.
+
+When `status` shows a `contract` field, surface those values when discussing the
+level — they explain why a lockout fired earlier than the absolute defaults.
+
+## Calibration & preview mode
+
+`status.thresholds` reports the user's **personal baseline** — long-block alerts
+fire at *their* p75/p90 minutes, not at absolute 90/150. For new installs, the
+first 7 days run in preview mode (`status.preview_mode: true`): L4/L5 surface as
+warnings instead of platform-blocking the prompt, so the user meets the system
+gradually. Don't reassure them that "it's only preview, ignore it" — note the
+warning, and treat the levels exactly as you would after preview ends.
+
 ## The parking lot
 
 While throttled or locked, capture incoming tasks instead of doing them:

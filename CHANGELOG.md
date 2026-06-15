@@ -1,5 +1,46 @@
 # Changelog
 
+## v4.0.0 — 2026-06-13
+
+**Personal calibration, pre-commitment contracts, daily pulse, sustainable
+rhythm.** Driven by a market scan: Whoop/Oura's personal-baseline model,
+Beeminder/Stickk's one-way ratchet, West et al.'s 1-item burnout measure, and
+Cold Turkey's "friction at the moment of intent." The original "5 profiles +
+init wizard" plan was discarded as a loophole — profiles let users argue the
+threshold down at exactly the wrong moment. v4 makes configurability a one-way
+ratchet *toward* protection only.
+
+- **Personal baseline.** Long-block and heavy-day alert thresholds derive from
+  *your* trailing 30-day p75/p90, clamped to absolute floors (60/120 min, 3h)
+  and ceilings (150/300 min, 8h). Marathon user gets alerts at THEIR 90th
+  percentile; recovery user at theirs. No profiles to pick. Falls back to v3.x
+  absolute defaults until 14 days of activity are observed.
+- **Contracts (`burnout.py contract set/show/clear`).** Pre-commit to stricter
+  thresholds at calm time:
+  ```
+  burnout.py contract set --lockout-index 60 --stop-by 22 --max-daily-hours 4
+  ```
+  Tightening applies instantly. Loosening — including `contract clear` —
+  queues for 7 days before taking effect. The contract floor on `lockout_index`
+  is honoured by `maybe_escalate`; cooldowns triggered by contract label as L4.
+- **Daily 1-item pulse (`burnout.py pulse 1-5`).** Fresh pulse (≤24h) augments
+  the self-report curve at 40% weight (vs 60% for a full 5-item check-in) and
+  lifts the behaviour-only L3 cap. Compliance-friendly daily signal alongside
+  the diagnostic check-in.
+- **Sustainable rhythm streak.** Replaces grind streak as the goal. Counts
+  consecutive days that had work AND no over-long block AND no late-night
+  block — the rhythm we actually want to grow. Legacy
+  `longest_streak_days_alltime` kept with a deprecation note in `report`;
+  drops in v5.
+- **Preview mode.** First 7 days from install, L4/L5 surface as warnings
+  instead of platform-blocking. Existing users upgrading don't get a fresh
+  preview — `preview_until` anchors to original `created_at`.
+- **Pre-session friction.** SessionStart hook now appends a personal-baseline
+  summary when the trailing week is heavier than the calibrated threshold —
+  intervention at the moment of intent, not 90 minutes in.
+- **State migration v4 → v5** (additive: `pulses`, `contract`, `preview_until`,
+  rhythm fields). All v3.x and v4 state files migrate cleanly.
+
 ## v3.2.0 — 2026-06-12
 
 **Transcript signal, all-time records, CLI graphs.**

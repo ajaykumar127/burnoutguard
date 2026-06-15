@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v3.2: + transcript signal, records, CLI graph).
+burnout.py — Burnout Guard engine (v4: personal baseline, contracts, daily pulse,
+sustainable-rhythm streak, preview mode).
 
 WHAT IT MEASURES (and deliberately doesn't)
   Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
@@ -8,14 +9,28 @@ WHAT IT MEASURES (and deliberately doesn't)
   hours of you typing at 1am is. So the behavioural signal is built from heartbeats:
   every prompt you send records a beat; beats <15 min apart stitch into continuous
   work blocks; blocks yield daily active hours, longest-stretch intensity, late-night
-  work, and grind streaks. Self-report still leads (60%).
+  work, and rhythm streaks. Self-report still leads (60%).
 
-  v3.2 adds a SECOND beat source: Claude Code transcripts at ~/.claude/projects/.
-  Each user prompt in those JSONL files is a beat. Transcripts give us cross-project
-  visibility, retroactive backfill (no hook needed for history), and survive when the
-  hook isn't installed. They're best-effort and merge into the same block-stitching
-  pipeline; if the directory is missing or unreadable we silently fall back to
-  heartbeats. claude.ai still relies on `log-session` + check-ins.
+  v3.2 added a SECOND beat source: Claude Code transcripts at ~/.claude/projects/.
+  Each user prompt in those JSONL files is a beat. Cross-project visibility,
+  retroactive backfill, hook-independent measurement.
+
+  v4 adds PERSONAL CALIBRATION on top:
+    - Personal baseline: alert thresholds derived from your trailing 30-day p75/p90,
+      clamped to absolute floors/ceilings. Marathon user gets alerts at THEIR 90th
+      percentile, not at an absolute number; recovery user the same. No profiles, no
+      loophole-by-preset.
+    - Contracts: Beeminder-style pre-commitment. Strictening is instant; loosening
+      has a 7-day cooling-off. The only configurability is a one-way ratchet toward
+      protection.
+    - Daily 1-item pulse (West et al.): 3-second daily check that smooths the
+      self-report curve and lifts the behaviour-only L3 cap when fresh.
+    - Sustainable-rhythm streak: replaces the grind-streak trophy. Counts days where
+      work happened AND no block exceeded the long-block-2 threshold AND no late-
+      night block fired. v4 keeps the legacy streak with a deprecation note; v5 will
+      drop it.
+    - Preview mode: first 7 days from install, L4/L5 blocks surface as warnings
+      instead of platform-blocking, so day-one users meet the system gradually.
 
 THE SIX LEVELS
   L0 Flow 0-24 | L1 Watch 25-39 | L2 Friction 40-54 | L3 Throttle 55-64
@@ -34,9 +49,9 @@ CLAUDE CODE INTEGRATION (real enforcement + console alerts)
     - Stop -> silent heartbeat so blocks reflect full turns.
 
 Subcommands:
-  status | log-session | checkin | defer | parked | cooldown start/clear |
-  override | history | report | heartbeat [--hook] [--event NAME] |
-  hook install|uninstall|status
+  status | log-session | checkin | pulse N | contract set/show/clear |
+  defer | parked | cooldown start/clear | override | tone | history | report |
+  heartbeat [--hook] [--event NAME] | hook install|uninstall|status
 
 State: ~/.burnout-guard/state.json (override with BURNOUT_GUARD_HOME).
 Exit codes: 0 work may proceed (L0-L2), 5 THROTTLED (L3), 10 LOCKED (L4/L5), 2 usage.
@@ -105,6 +120,38 @@ THROTTLE_REMINDER_MIN = 30    # throttle systemMessage cadence
 # Behaviour score weights (trailing 7 days)
 W_VOLUME, W_NIGHT, W_STREAK, W_INTENSITY = 0.30, 0.25, 0.20, 0.25
 
+# Personal-baseline calibration (v4). Floors keep an inactive user from disabling
+# protection ("my p90 block is 12 minutes so alert at 12 minutes" — no thanks).
+# Ceilings keep a marathon baseline from removing the cap entirely.
+BASELINE_LOOKBACK_DAYS = 30
+BASELINE_MIN_DAYS_ACTIVE = 14
+BASELINE_BOUNDS = {           # threshold_key: (floor, ceiling)
+    "long_block_1_min": (60, 150),
+    "long_block_2_min": (120, 300),
+    "heavy_day_hours":  (3, 8),
+}
+
+# Contracts (v4) — pre-commitment; loosening has a 7-day cooling-off.
+CONTRACT_LOOSEN_COOLOFF_DAYS = 7
+CONTRACT_FIELDS = ("lockout_index", "stop_by_hour", "max_daily_hours")
+# Defaults each contract field is compared against to decide stricter/looser.
+CONTRACT_DEFAULTS = {
+    "lockout_index":   65,                  # L4 boundary
+    "stop_by_hour":    LATE_NIGHT_START,    # 23
+    "max_daily_hours": HEAVY_DAY_HOURS,     # 4
+}
+# Direction of strictness: -1 means "lower is stricter", +1 "higher is stricter".
+CONTRACT_STRICT_DIR = {"lockout_index": -1, "stop_by_hour": -1, "max_daily_hours": -1}
+
+# Preview mode (v4) — first 7 days from state.created_at, L4/L5 blocks surface as
+# warnings rather than platform-blocking the prompt. Solves day-one surprise without
+# becoming a config knob.
+PREVIEW_DAYS = 7
+
+# Pulse (v4) — single-item daily burnout check (West et al. style).
+PULSE_FRESH_HOURS = 24
+PULSE_TO_INDEX = {1: 5, 2: 25, 3: 50, 4: 75, 5: 90}   # 1=fresh, 5=fumes
+
 # ---------------------------------------------------------------- state io
 
 def now() -> datetime:
@@ -117,19 +164,24 @@ def parse(ts: str) -> datetime:
     return datetime.fromisoformat(ts)
 
 def default_state() -> dict:
+    created = now()
     return {
-        "version": 4,
+        "version": 5,
         "config": {"tone": "supportive"},
-        "created_at": iso(now()),
+        "created_at": iso(created),
+        "preview_until": iso(created + timedelta(days=PREVIEW_DAYS)),
         "blocks": [],          # [{start, end, beats, late_night}] continuous work blocks
         "sessions": [],        # legacy/manual log-session entries (still honoured)
         "checkins": [],
+        "pulses": [],          # [{ts, value}] daily 1-item burnout reading
+        "contract": None,      # {lockout_index?, stop_by_hour?, max_daily_hours?, set_at,
+                               #  last_modified, pending_loosening?}
         "cooldown": None,
         "parking_lot": [],
         "override_penalty": 0,
         "last_alerts": {},     # {alert_key: iso_ts} rate limiting
         "events": [],
-        "records": {},         # all-time bests: longest sprint, longest streak
+        "records": {},         # all-time bests + sustainable rhythm
     }
 
 def load_state() -> dict:
@@ -151,8 +203,19 @@ def load_state() -> dict:
         state.setdefault("last_alerts", {})
     if v < 4:
         state.setdefault("records", {})
+    if v < 5:
+        state.setdefault("pulses", [])
+        state.setdefault("contract", None)
+        # Preview window: anchor to existing created_at so upgraders don't get a fresh
+        # 7-day grace they didn't ask for; if their preview already lapsed, leave it.
+        if "preview_until" not in state:
+            try:
+                created_at = parse(state.get("created_at", iso(now())))
+            except Exception:
+                created_at = now()
+            state["preview_until"] = iso(created_at + timedelta(days=PREVIEW_DAYS))
     state.setdefault("config", {"tone": "supportive"})
-    state["version"] = 4
+    state["version"] = 5
     return state
 
 def save_state(state: dict) -> None:
@@ -287,8 +350,11 @@ def unified_blocks(state: dict, days: int) -> list[dict]:
 
 # ---------------------------------------------------------------- records
 
-def update_records(state: dict, blocks: list[dict]) -> None:
-    """Track all-time longest sprint and longest active-day streak (idempotent)."""
+def update_records(state: dict, blocks: list[dict], thresh: dict) -> None:
+    """Track all-time longest sprint, legacy active-day streak (deprecated, kept until
+    v5), and sustainable-rhythm streak (the v4 metric we actually want). All updates
+    idempotent; thresholds come from the resolved baseline so 'no-blowout day' tracks
+    a personal definition, not the absolute defaults."""
     rec = state.setdefault("records", {})
     if blocks:
         longest = max(blocks, key=block_minutes)
@@ -296,6 +362,8 @@ def update_records(state: dict, blocks: list[dict]) -> None:
         if cur > rec.get("longest_block_min_alltime", 0):
             rec["longest_block_min_alltime"] = cur
             rec["longest_block_at"] = longest["end"]
+
+    # Legacy grind streak (deprecated in v4, drops in v5)
     days_active = {parse(b["start"]).date() for b in blocks}
     streak, d = 0, now().date()
     while d in days_active:
@@ -305,6 +373,146 @@ def update_records(state: dict, blocks: list[dict]) -> None:
         rec["longest_streak_days_alltime"] = streak
         rec["longest_streak_at"] = iso(now())
     rec["current_streak_days"] = streak
+
+    # Sustainable rhythm streak: a "good day" had work AND no block above
+    # long_block_2 AND no late-night block. The metric we actually want to grow.
+    by_day: dict = {}
+    for b in blocks:
+        by_day.setdefault(parse(b["start"]).date(), []).append(b)
+    long_cap = thresh["long_block_2_min"]
+    good_days = {d for d, day_blocks in by_day.items()
+                 if all(block_minutes(b) <= long_cap for b in day_blocks)
+                 and not any(b.get("late_night") for b in day_blocks)}
+    rs, d = 0, now().date()
+    while d in good_days:
+        rs += 1
+        d -= timedelta(days=1)
+    rec["sustainable_rhythm_streak_current"] = rs
+    if rs > rec.get("sustainable_rhythm_streak_alltime", 0):
+        rec["sustainable_rhythm_streak_alltime"] = rs
+        rec["sustainable_rhythm_streak_at"] = iso(now())
+
+# ---------------------------------------------------------------- baseline
+
+def percentile(values: list[float], pct: float) -> float:
+    """Linear-interp percentile. Empty -> 0. pct in [0, 100]."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return float(s[0])
+    k = (len(s) - 1) * pct / 100.0
+    f = int(k)
+    c = min(f + 1, len(s) - 1)
+    return float(s[f] + (s[c] - s[f]) * (k - f))
+
+def baseline(state: dict) -> dict:
+    """Return calibrated alert thresholds — long_block_1/2 minutes and heavy_day
+    hours — derived from the trailing 30 days. Falls back to absolute defaults until
+    BASELINE_MIN_DAYS_ACTIVE distinct days are observed; clamps within
+    BASELINE_BOUNDS so a couch-potato baseline can't disable protection and a
+    marathon baseline can't remove the cap."""
+    blocks = unified_blocks(state, days=BASELINE_LOOKBACK_DAYS)
+    days_seen = {parse(b["start"]).date() for b in blocks}
+
+    if len(days_seen) < BASELINE_MIN_DAYS_ACTIVE:
+        return {"calibrated": False, "days_observed": len(days_seen),
+                "long_block_1_min": LONG_BLOCK_1_MIN,
+                "long_block_2_min": LONG_BLOCK_2_MIN,
+                "heavy_day_hours":  HEAVY_DAY_HOURS}
+
+    durations = [block_minutes(b) for b in blocks]
+    daily_min: dict = {}
+    for b in blocks:
+        daily_min[parse(b["start"]).date()] = \
+            daily_min.get(parse(b["start"]).date(), 0) + block_minutes(b)
+    daily_hours = [m / 60 for m in daily_min.values()]
+
+    def clamp_within(value: float, key: str) -> float:
+        lo, hi = BASELINE_BOUNDS[key]
+        return max(lo, min(hi, value))
+
+    return {"calibrated": True, "days_observed": len(days_seen),
+            "long_block_1_min": round(clamp_within(percentile(durations, 75),
+                                                   "long_block_1_min")),
+            "long_block_2_min": round(clamp_within(percentile(durations, 90),
+                                                   "long_block_2_min")),
+            "heavy_day_hours":  round(clamp_within(percentile(daily_hours, 75),
+                                                   "heavy_day_hours"), 1)}
+
+# ---------------------------------------------------------------- contract
+
+def contract_is_stricter(field: str, new_val: float, current_val: float) -> bool:
+    """True iff new_val tightens protection vs current_val for this field."""
+    direction = CONTRACT_STRICT_DIR[field]
+    if direction < 0:
+        return new_val < current_val
+    return new_val > current_val
+
+def effective_contract(state: dict) -> dict:
+    """Resolved contract values, applying any pending loosening that has matured.
+    Returns {} if no contract is active. Does NOT mutate state — that happens in
+    settle_contract() called from save paths."""
+    c = state.get("contract")
+    if not c:
+        return {}
+    out = {f: c[f] for f in CONTRACT_FIELDS if f in c}
+    pl = c.get("pending_loosening")
+    if pl and parse(pl["applies_at"]) <= now():
+        out.update(pl.get("values", {}))
+    return out
+
+def settle_contract(state: dict) -> bool:
+    """If a pending loosening has matured, apply it permanently. Returns True if
+    state was mutated. Called from any command that saves state."""
+    c = state.get("contract")
+    if not c:
+        return False
+    pl = c.get("pending_loosening")
+    if not pl:
+        return False
+    if parse(pl["applies_at"]) > now():
+        return False
+    c.update(pl.get("values", {}))
+    c["last_modified"] = iso(now())
+    c.pop("pending_loosening")
+    audit(state, "contract_loosen_applied", json.dumps(pl.get("values", {})))
+    return True
+
+def resolved_thresholds(state: dict) -> dict:
+    """Baseline thresholds, then tightened by contract where applicable. This is the
+    single source of truth that build_console_alerts and update_records consult."""
+    bl = baseline(state)
+    out = {"long_block_1_min": bl["long_block_1_min"],
+           "long_block_2_min": bl["long_block_2_min"],
+           "heavy_day_hours":  bl["heavy_day_hours"],
+           "lockout_index":    65,
+           "stop_by_hour":     LATE_NIGHT_START,
+           "max_daily_hours":  bl["heavy_day_hours"],
+           "calibrated":       bl["calibrated"],
+           "days_observed":    bl["days_observed"]}
+    c = effective_contract(state)
+    # Contracts can only tighten beyond defaults — they cannot weaken baseline.
+    if "lockout_index" in c:
+        out["lockout_index"] = min(out["lockout_index"], c["lockout_index"])
+    if "stop_by_hour" in c:
+        out["stop_by_hour"] = min(out["stop_by_hour"], c["stop_by_hour"])
+    if "max_daily_hours" in c:
+        out["max_daily_hours"] = min(out["max_daily_hours"], c["max_daily_hours"])
+        # contract-tightened heavy day also pulls the alert threshold down
+        out["heavy_day_hours"] = min(out["heavy_day_hours"], c["max_daily_hours"])
+    return out
+
+# ---------------------------------------------------------------- preview mode
+
+def in_preview(state: dict) -> bool:
+    pu = state.get("preview_until")
+    if not pu:
+        return False
+    try:
+        return now() < parse(pu)
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------- behaviour
 
@@ -318,7 +526,8 @@ def behaviour_score(state: dict) -> dict:
     cutoff = now() - timedelta(days=7)
     blocks = unified_blocks(state, days=7)
     sessions = [s for s in state["sessions"] if parse(s["ts"]) >= cutoff]
-    update_records(state, unified_blocks(state, days=TRANSCRIPT_LOOKBACK_DAYS))
+    update_records(state, unified_blocks(state, days=TRANSCRIPT_LOOKBACK_DAYS),
+                   resolved_thresholds(state))
 
     daily_min: dict = {}
     for b in blocks:
@@ -357,15 +566,23 @@ def clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 def self_report_score(state: dict) -> float | None:
-    if not state["checkins"]:
-        return None
-    last = state["checkins"][-1]
-    if now() - parse(last["ts"]) > timedelta(hours=72):
-        return None
-    raw = ((last["exhaustion"] - 1) * 1.25 + (last["detachment"] - 1) * 1.25 +
-           (5 - last["efficacy"]) * 1.0 + (5 - last["sleep"]) * 0.75 +
-           (last["pressure"] - 1) * 0.75)
-    return clamp(raw * 5.0, 0, 100)
+    """Prefer a fresh 5-item check-in (≤72h). If none, accept a fresh 1-item pulse
+    (≤24h) at reduced weight via the index-only path. Returns None when neither
+    source is fresh — behaviour-only mode (capped at L3) kicks in."""
+    last_full = state["checkins"][-1] if state.get("checkins") else None
+    if last_full and now() - parse(last_full["ts"]) <= timedelta(hours=72):
+        raw = ((last_full["exhaustion"] - 1) * 1.25
+               + (last_full["detachment"] - 1) * 1.25
+               + (5 - last_full["efficacy"]) * 1.0
+               + (5 - last_full["sleep"]) * 0.75
+               + (last_full["pressure"] - 1) * 0.75)
+        return clamp(raw * 5.0, 0, 100)
+
+    last_pulse = state["pulses"][-1] if state.get("pulses") else None
+    if last_pulse and now() - parse(last_pulse["ts"]) <= timedelta(hours=PULSE_FRESH_HOURS):
+        return float(PULSE_TO_INDEX.get(int(last_pulse["value"]), 50))
+
+    return None
 
 def level_for(index: float) -> tuple[int, str]:
     for lvl, name, lo, hi in reversed(LEVELS):
@@ -373,12 +590,30 @@ def level_for(index: float) -> tuple[int, str]:
             return lvl, name
     return 0, "Flow"
 
+def self_report_source(state: dict) -> str | None:
+    """Which fresh source produced self_report_score, if any."""
+    last_full = state["checkins"][-1] if state.get("checkins") else None
+    if last_full and now() - parse(last_full["ts"]) <= timedelta(hours=72):
+        return "checkin"
+    last_pulse = state["pulses"][-1] if state.get("pulses") else None
+    if last_pulse and now() - parse(last_pulse["ts"]) <= timedelta(hours=PULSE_FRESH_HOURS):
+        return "pulse"
+    return None
+
 def compute_index(state: dict) -> dict:
     sr = self_report_score(state)
     bh = behaviour_score(state)
+    src = self_report_source(state)
     if sr is None:
         index = clamp(bh["score"], 0, 64)   # behaviour alone can throttle, never lock
-        basis = "behaviour-only (no check-in in 72h; capped at L3 — invite a check-in)"
+        basis = ("behaviour-only (no check-in/pulse fresh; capped at L3 — "
+                 "log a pulse or check-in to lift the cap)")
+    elif src == "pulse":
+        # Pulse is a lighter self-report; weight it less than a full 5-item check-in.
+        # Cap at L3 still lifts (we have *some* self-report), but blend leans behaviour.
+        index = 0.4 * sr + 0.6 * bh["score"]
+        index = max(index, sr * SEVERE_SELF_REPORT_FLOOR)
+        basis = "blended (40% pulse, 60% behaviour; full check-in welcome)"
     else:
         index = SELF_REPORT_WEIGHT * sr + BEHAVIOUR_WEIGHT * bh["score"]
         index = max(index, sr * SEVERE_SELF_REPORT_FLOOR)
@@ -387,6 +622,7 @@ def compute_index(state: dict) -> dict:
     lvl, name = level_for(index)
     return {"index": round(index, 1), "level": lvl, "level_name": name,
             "self_report": None if sr is None else round(sr, 1),
+            "self_report_source": src,
             "behaviour": bh["score"], "behaviour_detail": bh,
             "basis": basis, "override_penalty": state.get("override_penalty", 0)}
 
@@ -409,8 +645,14 @@ def start_cooldown(state: dict, index: float, level: int, reason: str) -> dict:
 def maybe_escalate(state: dict, score: dict, source: str) -> None:
     lvl, idx = score["level"], score["index"]
     cd = state.get("cooldown")
-    if lvl >= 4 and not cd:
-        start_cooldown(state, idx, lvl, f"auto: L{lvl} on {source}")
+    contract_floor = resolved_thresholds(state)["lockout_index"]   # 65 default; contract may lower
+    contract_triggered = contract_floor < 65 and lvl < 4 and idx >= contract_floor
+    if (lvl >= 4 or contract_triggered) and not cd:
+        # Contract-triggered cooldowns label as L4 ("Lockout"): no task work, override available.
+        effective_lvl = max(lvl, 4)
+        reason = (f"contract: index {idx} >= committed floor {contract_floor}"
+                  if contract_triggered else f"auto: L{lvl} on {source}")
+        start_cooldown(state, idx, effective_lvl, reason)
     elif cd and lvl == 5 and cd.get("trigger_level", 4) < 5:
         start_cooldown(state, idx, 5, f"escalation: L4 -> L5 on {source}")
 
@@ -524,10 +766,15 @@ def msg(state: dict, key: str, **kw) -> str:
 
 def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
                          prompt: str = "") -> dict:
-    """Returns hook-output JSON: a block decision, a systemMessage alert, or {}."""
+    """Returns hook-output JSON: a block decision, a systemMessage alert, or {}.
+
+    Thresholds are personal (baseline + contract floor) once enough days are
+    observed; until then they fall back to absolute defaults. During preview mode
+    (first 7 days from install) L4/L5 surface as warnings instead of platform-
+    blocking the prompt — meant to ease day-one users into the system."""
+    thresh = resolved_thresholds(state)
+
     # Deliberate-act passthrough: conversation, exit ritual, parking, emergencies.
-    # Claude still applies the level protocol (no task work at L4/L5) — this opens
-    # the conversational channel, not the workbench.
     if cd["locked"] and prompt.strip().lower().startswith(PASS_PREFIXES):
         lvl = cd["lock_level"]
         return {"systemMessage": msg(state, "bg_open", lvl=lvl),
@@ -542,7 +789,7 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
         return {"systemMessage": "🧯 Override grace active — lockout enforcement "
                                  "resumes when the 60-minute window closes."}
 
-    # 1) Locked: hard-block the prompt at the platform level.
+    # 1) Locked.
     if cd["locked"]:
         lock_lvl = cd["lock_level"]
         if cd["timer_elapsed"]:
@@ -557,30 +804,42 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
                          name="Hard Lockout" if lock_lvl >= 5 else "Lockout",
                          remaining=cd["remaining_human"], idx=cd["trigger_index"],
                          override=override_txt)
+        # Preview mode: soften the platform block to a console warning so first-week
+        # users see what would happen without being surprised. Real enforcement
+        # engages once preview_until passes.
+        if in_preview(state):
+            return {"systemMessage": "🧯 PREVIEW: a real lockout would fire here. "
+                    + reason
+                    + " Real enforcement engages after "
+                    + state.get("preview_until", "") + "."}
         return {"decision": "block", "reason": reason}
 
     msgs = []
     mins = block_minutes(block)
-    bd = score["behaviour_detail"]
 
     # 2) Throttle reminder (rate-limited).
     if score["level"] == 3 and alert_due(state, "throttle", THROTTLE_REMINDER_MIN):
         msgs.append(msg(state, "throttle", index=score["index"]))
 
-    # 3) Continuous-stretch alerts.
-    if mins >= LONG_BLOCK_2_MIN and alert_due(state, "block150"):
+    # 3) Continuous-stretch alerts (personalised).
+    long2 = thresh["long_block_2_min"]
+    long1 = thresh["long_block_1_min"]
+    if mins >= long2 and alert_due(state, "block150"):
         msgs.append(msg(state, "block150", h=int(mins // 60), m=int(mins % 60)))
-    elif mins >= LONG_BLOCK_1_MIN and alert_due(state, "block90"):
+    elif mins >= long1 and alert_due(state, "block90"):
         msgs.append(msg(state, "block90", mins=int(mins)))
 
-    # 4) Heavy-day alert.
+    # 4) Heavy-day alert (personalised; contract can pull this earlier).
     today_min = sum(block_minutes(b) for b in state["blocks"]
                     if parse(b["start"]).date() == now().date())
-    if today_min >= HEAVY_DAY_HOURS * 60 and alert_due(state, "heavyday", 120):
+    if today_min >= thresh["heavy_day_hours"] * 60 and alert_due(state, "heavyday", 120):
         msgs.append(msg(state, "heavyday", hours=f"{today_min / 60:.1f}"))
 
-    # 5) Late-night start.
-    if is_late(datetime.now()) and alert_due(state, "latenight", 120):
+    # 5) Late-night start (contract can pull stop_by_hour earlier than 23).
+    local_now = datetime.now()
+    stop_h = thresh["stop_by_hour"]
+    if (local_now.hour >= stop_h or local_now.hour < LATE_NIGHT_END) \
+       and alert_due(state, "latenight", 120):
         msgs.append(msg(state, "latenight"))
 
     if msgs:
@@ -603,9 +862,22 @@ def cmd_heartbeat(args):
         cd = cooldown_status(state)
 
         if args.event == "session-start":
+            bd = score["behaviour_detail"]
+            thresh = resolved_thresholds(state)
             ctx = (f"Burnout Guard status: index {score['index']} — "
                    f"L{score['level']} {score['level_name']}. "
                    f"{LEVEL_INSTRUCTIONS[max(score['level'], cd['lock_level'] if cd['locked'] else 0)]}")
+            # Pre-session friction: surface personal-baseline summary when the past
+            # week is heavier than the user's calibrated norm. Friction at the moment
+            # of intent (Cold Turkey/Opal pattern) beats nag 90 minutes in.
+            if thresh["calibrated"] and bd["avg_hours_per_day"] >= thresh["heavy_day_hours"]:
+                ctx += (f" Heads-up: {bd['avg_hours_per_day']}h/day this week vs "
+                        f"your ~{thresh['heavy_day_hours']}h personal heavy-day "
+                        f"threshold — Claude should ask once whether today is meant "
+                        f"to be a lighter day before diving into task work.")
+            elif in_preview(state):
+                ctx += (f" Preview mode active until {state.get('preview_until','')}: "
+                        f"L4/L5 will surface as warnings, not platform blocks.")
             out = {"hookSpecificOutput": {"hookEventName": "SessionStart",
                                           "additionalContext": ctx}}
         elif args.event == "stop":
@@ -624,8 +896,10 @@ def cmd_heartbeat(args):
 
 def cmd_status(args):
     state = load_state()
+    settle_contract(state)
     score = compute_index(state)
     cd = cooldown_status(state)
+    thresh = resolved_thresholds(state)
     if cd["locked"]:
         effective, verdict, code = max(score["level"], cd["lock_level"], 4), "LOCKED", 10
     elif score["level"] == 3:
@@ -637,6 +911,10 @@ def cmd_status(args):
                       "cooldown": cd, "parking_lot_size": len(state["parking_lot"]),
                       "verdict": verdict, "tone": tone_of(state),
                       "records": state.get("records", {}),
+                      "thresholds": thresh,
+                      "contract": effective_contract(state) or None,
+                      "preview_mode": in_preview(state),
+                      "preview_until": state.get("preview_until"),
                       "instruction": LEVEL_INSTRUCTIONS[effective]},
                      indent=2))
     sys.exit(code)
@@ -781,6 +1059,121 @@ def cmd_override(args):
                                 f"+{OVERRIDE_PENALTY} penalty until next calm check-in."},
                      indent=2))
 
+def cmd_pulse(args):
+    """Daily 1-item burnout reading. Cheap to log every day; smooths self-report."""
+    state = load_state()
+    if not 1 <= args.value <= 5:
+        print("error: value must be 1-5 (1=fresh, 5=fumes)", file=sys.stderr)
+        sys.exit(2)
+    settle_contract(state)
+    state["pulses"].append({"ts": iso(now()), "value": int(args.value),
+                            "note": (args.note or "").strip() or None})
+    state["pulses"] = state["pulses"][-365:]
+    audit(state, "pulse", str(args.value))
+    score = compute_index(state)
+    maybe_escalate(state, score, "pulse")
+    save_state(state)
+    print(json.dumps({"recorded": True, "value": int(args.value),
+                      "score": score, "cooldown": cooldown_status(state)}, indent=2))
+
+def _contract_normalize(state: dict, candidate: dict) -> tuple[dict, dict]:
+    """Split a candidate contract update into (apply_now, queue_loosen) by comparing
+    each field against the current effective value. Stricter changes apply
+    immediately; looser changes wait CONTRACT_LOOSEN_COOLOFF_DAYS."""
+    eff = effective_contract(state)
+    apply_now: dict = {}
+    queue_loosen: dict = {}
+    for f, v in candidate.items():
+        baseline_val = eff.get(f, CONTRACT_DEFAULTS[f])
+        if contract_is_stricter(f, v, baseline_val):
+            apply_now[f] = v
+        elif v == baseline_val:
+            continue
+        else:
+            queue_loosen[f] = v
+    return apply_now, queue_loosen
+
+def cmd_contract(args):
+    """Pre-commitment device. Tightening is instant; loosening waits 7 days."""
+    state = load_state()
+    settle_contract(state)
+
+    if args.action == "show":
+        eff = effective_contract(state)
+        print(json.dumps({"contract": state.get("contract"),
+                          "effective": eff,
+                          "thresholds": resolved_thresholds(state)}, indent=2))
+        return
+
+    if args.action == "clear":
+        cur = state.get("contract") or {}
+        # If the contract was making things stricter, clearing it is a loosening —
+        # apply the same 7-day cooling-off. Otherwise (already-empty contract)
+        # this is a no-op.
+        if not cur or all(f not in cur for f in CONTRACT_FIELDS):
+            state["contract"] = None
+            save_state(state)
+            print(json.dumps({"cleared": True, "detail": "no active contract"}, indent=2))
+            return
+        cur["pending_loosening"] = {
+            "values": {f: CONTRACT_DEFAULTS[f] for f in CONTRACT_FIELDS if f in cur},
+            "requested_at": iso(now()),
+            "applies_at": iso(now() + timedelta(days=CONTRACT_LOOSEN_COOLOFF_DAYS)),
+            "kind": "clear",
+        }
+        audit(state, "contract_clear_queued", "")
+        save_state(state)
+        print(json.dumps({"queued": True,
+                          "detail": f"clear scheduled for {cur['pending_loosening']['applies_at']} "
+                                    f"({CONTRACT_LOOSEN_COOLOFF_DAYS}-day cooling-off; "
+                                    "stricter pre-commitments shouldn't be undone in the moment)",
+                          "contract": state["contract"]}, indent=2))
+        return
+
+    # set
+    candidate: dict = {}
+    if args.lockout_index is not None:
+        if not 40 <= args.lockout_index <= 65:
+            print("error: --lockout-index must be 40-65 (40=L2, 65=L4 default)", file=sys.stderr)
+            sys.exit(2)
+        candidate["lockout_index"] = int(args.lockout_index)
+    if args.stop_by is not None:
+        if not 16 <= args.stop_by <= 23:
+            print("error: --stop-by must be hour 16-23 (24h clock)", file=sys.stderr)
+            sys.exit(2)
+        candidate["stop_by_hour"] = int(args.stop_by)
+    if args.max_daily_hours is not None:
+        if not 1.0 <= args.max_daily_hours <= 8.0:
+            print("error: --max-daily-hours must be 1.0-8.0", file=sys.stderr)
+            sys.exit(2)
+        candidate["max_daily_hours"] = float(args.max_daily_hours)
+    if not candidate:
+        print("error: nothing to set; pass at least one of "
+              "--lockout-index / --stop-by / --max-daily-hours", file=sys.stderr)
+        sys.exit(2)
+
+    apply_now, queue_loosen = _contract_normalize(state, candidate)
+    c = state.get("contract") or {"set_at": iso(now())}
+    if apply_now:
+        c.update(apply_now)
+        c["last_modified"] = iso(now())
+        audit(state, "contract_tighten", json.dumps(apply_now))
+    if queue_loosen:
+        c["pending_loosening"] = {
+            "values": queue_loosen,
+            "requested_at": iso(now()),
+            "applies_at": iso(now() + timedelta(days=CONTRACT_LOOSEN_COOLOFF_DAYS)),
+            "kind": "loosen",
+        }
+        audit(state, "contract_loosen_queued", json.dumps(queue_loosen))
+    state["contract"] = c
+    save_state(state)
+    print(json.dumps({"applied_now": apply_now,
+                      "queued_loosen": queue_loosen,
+                      "queued_until": c.get("pending_loosening", {}).get("applies_at"),
+                      "effective": effective_contract(state),
+                      "thresholds": resolved_thresholds(state)}, indent=2))
+
 def cmd_history(args):
     state = load_state()
     print(json.dumps({"recent_checkins": state["checkins"][-args.n:],
@@ -874,16 +1267,29 @@ def cmd_report(args):
     spark = sparkline([m for _, m in daily])
     peak_min = max((m for _, m in daily), default=0)
 
+    pulses_14 = [p for p in state.get("pulses", []) if parse(p["ts"]) >= cutoff]
+    thresh = resolved_thresholds(state)
+    eff_contract = effective_contract(state)
+
+    cal_line = (f"**Calibration:** personal baseline ({thresh['days_observed']} days observed) — "
+                f"long-block alerts at {thresh['long_block_1_min']}/{thresh['long_block_2_min']} min, "
+                f"heavy day at {thresh['heavy_day_hours']}h, "
+                f"late-night from {thresh['stop_by_hour']:02d}:00."
+                if thresh["calibrated"] else
+                f"**Calibration:** still warming up ({thresh['days_observed']} of "
+                f"{BASELINE_MIN_DAYS_ACTIVE} days observed) — using absolute defaults.")
+
     lines = [
         "# Burnout Guard — 14-day report",
         f"\n**Current index:** {score['index']} — **L{score['level']} {score['level_name']}**",
         f"**Basis:** {score['basis']}",
         f"**Lockout:** {'ACTIVE (L' + str(cd['lock_level']) + ') until ' + cd['ends_at'] if cd['locked'] else 'none'}",
+        f"{cal_line}",
+        f"**Preview mode:** {'active until ' + state.get('preview_until','') if in_preview(state) else 'off'}",
         f"\n## Attention (trailing 7 days)",
         f"- Average focused hours/day: {bd['avg_hours_per_day']}",
         f"- Longest continuous stretch: {bd['longest_block_min']} min",
         f"- Late-night blocks: {bd['late_night_blocks_7d']}",
-        f"- Active-day streak: {bd['streak_days']}",
         f"- Behaviour score: {bd['score']}/100",
         f"\n## Daily focus (14d, mins/day, peak ~{int(peak_min)})",
         f"  {daily[0][0]} {spark} {daily[-1][0]}",
@@ -892,15 +1298,31 @@ def cmd_report(args):
         f"\n## Records",
         f"- Longest sprint ever: {rec.get('longest_block_min_alltime', 0)} min"
         + (f" (on {rec['longest_block_at']})" if rec.get('longest_block_at') else ""),
-        f"- Longest active-day streak: {rec.get('longest_streak_days_alltime', 0)} day(s)"
-        + (f", current streak: {rec.get('current_streak_days', 0)}"),
-        f"\n## Self-report\n- Check-ins (14d): {len(checkins)}",
+        f"- **Sustainable rhythm streak (the one to grow):** "
+        f"{rec.get('sustainable_rhythm_streak_current', 0)} day(s) current, "
+        f"{rec.get('sustainable_rhythm_streak_alltime', 0)} day(s) all-time — "
+        "days with work AND no over-long block AND no late-night block",
+        f"- ~~Longest active-day streak: {rec.get('longest_streak_days_alltime', 0)} day(s)~~ "
+        f"(deprecated; rewards grinding — drops in v5)",
+        f"\n## Self-report",
+        f"- Daily pulses (14d): {len(pulses_14)}"
+        + (f", latest: {pulses_14[-1]['value']}/5 ({pulses_14[-1]['ts']})" if pulses_14 else ""),
+        f"- Full check-ins (14d): {len(checkins)}",
     ]
     if checkins:
         last = checkins[-1]
-        lines.append(f"- Latest ({last['ts']}): exhaustion {last['exhaustion']}/5, "
+        lines.append(f"- Latest check-in ({last['ts']}): exhaustion {last['exhaustion']}/5, "
                      f"detachment {last['detachment']}/5, efficacy {last['efficacy']}/5, "
                      f"sleep {last['sleep']}/5, pressure {last['pressure']}/5")
+    if eff_contract:
+        lines.append(f"\n## Contract (pre-commitments)")
+        for f in CONTRACT_FIELDS:
+            if f in eff_contract:
+                lines.append(f"- {f}: {eff_contract[f]} (default {CONTRACT_DEFAULTS[f]})")
+        pl = (state.get("contract") or {}).get("pending_loosening")
+        if pl:
+            lines.append(f"- pending loosening applies at {pl['applies_at']}: "
+                         f"{json.dumps(pl.get('values', {}))}")
     lines += [f"\n## Enforcement\n- Lockouts triggered (14d): {len(lockouts)}",
               f"- Parking lot: {len(state['parking_lot'])} item(s)",
               f"- Override penalty in effect: +{state.get('override_penalty', 0)}",
@@ -1043,6 +1465,23 @@ def main():
     tn = sub.add_parser("tone")
     tn.add_argument("mode", choices=["supportive", "sarcastic", "show"])
     tn.set_defaults(fn=cmd_tone)
+
+    pl = sub.add_parser("pulse",
+                        help="daily 1-item burnout reading (1=fresh, 5=fumes)")
+    pl.add_argument("value", type=int, help="1-5")
+    pl.add_argument("--note", type=str, default="")
+    pl.set_defaults(fn=cmd_pulse)
+
+    co = sub.add_parser("contract",
+                        help="pre-commitment device — tighten now, loosening waits 7 days")
+    co.add_argument("action", choices=["set", "show", "clear"])
+    co.add_argument("--lockout-index", type=int, default=None,
+                    help="trigger lockout at this index (40-65; default 65)")
+    co.add_argument("--stop-by", type=int, default=None,
+                    help="late-night threshold hour, 24h clock (16-23; default 23)")
+    co.add_argument("--max-daily-hours", type=float, default=None,
+                    help="heavy-day alert threshold in hours (1.0-8.0; default 4)")
+    co.set_defaults(fn=cmd_contract)
 
     hi = sub.add_parser("history")
     hi.add_argument("-n", type=int, default=10)
