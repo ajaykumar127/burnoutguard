@@ -1,5 +1,51 @@
 # Changelog
 
+## v5.0.0 — 2026-06-16
+
+**The sprint-aware release.** Burnout Guard now thinks in weeks, not just blocks.
+
+- **Multi-week strain (Whoop-style debt model).** New `strain_score` derives a
+  0–100 trajectory from a rolling 30-day debt: `sum(daily_focus above pivot)
+  - sum(recovery_credit on light/rest days)`, normalized against a
+  30-hour debt ceiling. Surfaced in `status.strain` and a dedicated `report`
+  section with a four-band advisory (Light / Moderate / High / Critical).
+  Distinct from the burnout index — index is *now*, strain is *trajectory*.
+- **Sprint declaration (`burnout.py sprint declare/show/finish/cancel`).**
+  Pre-commit to a 1–21 day push with a name and rationale. During: long-block
+  thresholds widen by 1.3×, heavy-day by 1.5× (still clamped within absolute
+  bounds). After (`recovery` phase, half the sprint duration): heavy-day
+  tightens by 0.7×, lockout floor pulls in to index 60. **Cancel queues 7
+  days** — same one-way ratchet as contracts. The sprint you committed to on
+  Sunday isn't dissolved at 11pm Wednesday.
+- **Per-project rollup.** Transcripts already carry `cwd`. v5 groups blocks by
+  project, surfaces top-5 in `report`, and adds `burnout.py project mark
+  --path X --deep-work` to widen long-block thresholds by 1.25× when active in
+  a flagged project. Lockout boundary unaffected.
+- **Stuck-loop detection (conservative; console-only).** Heuristic on recent
+  transcript prompts: ≥4 prompts in 10 min with mean pairwise Jaccard ≥0.5
+  triggers a "looks like a stuck loop" nudge at 60% of the long-block-1
+  threshold. Cannot affect the index or trigger a lockout — false-positives
+  cost a console line. Opt-out via `state.config.stuck_detection`.
+- **Recovery prescription.** Lockout exit is no longer just a timer. New
+  `recovery_prescription(state)` derives plain-language advice from observable
+  signal (last sleep score, late-night blocks, current strain) and surfaces in
+  `cooldown_status`, `report` (when locked), and the timer-elapsed message.
+- **Removed: legacy grind streak.** `longest_streak_days_alltime`,
+  `longest_streak_at`, `current_streak_days` are dropped (deprecated in v4).
+  v4→v5 migration purges those fields from existing state. The sustainable
+  rhythm streak is the metric.
+- **Threshold pipeline.** `resolved_thresholds()` now resolves baseline →
+  contract → sprint phase → deep-work project, in that order. Heartbeat hook
+  reads `cwd` from the hook payload and feeds it through.
+
+### Migration notes
+
+- State v5 → v6 is additive plus a removal: adds `sprint`, `projects`,
+  `config.stuck_detection`; removes the three legacy streak record keys.
+  Tested against v3.x, v4, and v5 starting states.
+- `resolved_thresholds(state, cwd=...)` is now cwd-aware. Existing callers
+  with `resolved_thresholds(state)` still work.
+
 ## v4.0.0 — 2026-06-13
 
 **Personal calibration, pre-commitment contracts, daily pulse, sustainable

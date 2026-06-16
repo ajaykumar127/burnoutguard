@@ -111,6 +111,73 @@ work around it. If they want to *strengthen* their commitment, that's instant.
 When `status` shows a `contract` field, surface those values when discussing the
 level — they explain why a lockout fired earlier than the absolute defaults.
 
+## Sprints (committed effort windows)
+
+A user can declare a 1–21 day sprint:
+
+```bash
+python3 scripts/burnout.py sprint declare --name "Q3 launch" --until 2026-06-30 \
+  --rationale "demo deadline; pre-committing to harder push"
+```
+
+`status.sprint_phase` reads `active`, `recovery`, or `none`. During an active
+sprint, long-block and heavy-day thresholds are widened — that's by design,
+the user committed to push harder. Don't talk them down from work that is
+within their declared scope; do still log the alerts that fire (some still will).
+After the sprint date passes, the engine enters a recovery window (half the
+sprint duration) with **tighter** heavy-day threshold and a pulled-in lockout
+floor at index 60. During recovery, treat the user as already in a fragile
+window — push back on new commitments, surface the recovery prescription, and
+remind them this rest is what they pre-committed to.
+
+If the user asks to cancel a sprint mid-flight, run `sprint cancel` — it
+queues for 7 days, and the sprint stays active during the cool-off so they
+can finish what they committed to. **Don't suggest they "just declare a new
+sprint" to extend** — that's exactly the renegotiation the design exists to
+prevent. If the work is genuinely longer, point them at `sprint finish` (ends
+early into recovery) and a fresh declare *after* the recovery window closes.
+
+## Strain (trajectory, not now)
+
+`status.strain.score` is a 0–100 *trajectory* (rolling 30-day debt vs recovery
+credit), distinct from the burnout index. Surface both as different things:
+
+- **Index** answers "am I burnt out *right now*?"
+- **Strain** answers "am I heading there?"
+
+Strain bands: `Light` (0–39, healthy), `Moderate` (40–59, climbing), `High`
+(60–79, schedule a real day off in 72h), `Critical` (80–100, recovery owed
+before another sprint). Mention the band when discussing the level — it
+explains why the protocol feels stricter than the index alone would suggest.
+
+## Per-project context
+
+`status.thresholds.deep_work_active: true` means the user is currently in a
+project they've flagged with `project mark --deep-work` (long-block thresholds
+widened 1.25× for that cwd). Treat this as them having pre-declared "this work
+is harder than my baseline." Don't undermine it with concern about block
+length; the threshold already accounts for it.
+
+`report` shows top projects by 7-day attention. If one project is dominating
+and the user is asking about strain, name the project specifically — *"most of
+that 6h/day is on the auth rewrite"* — rather than abstract totals.
+
+## Recovery prescription
+
+When `status.recovery` is present (cooldown active), surface it verbatim or in
+your own words — but keep the specifics. *Recovery suggested: a real night of
+sleep; a no-Claude window tomorrow until midday; at least one fully off day
+in the next 72h.* Plain advice. Not medical.
+
+## Stuck-loop nudges
+
+If the engine fires the stuck-loop console nudge, it is signalling that the
+user has sent several near-duplicate prompts in a short window. Don't pretend
+you didn't see it. The right response is one short observation ("we've been
+circling this for the last few prompts — want to step back and describe the
+shape of the problem before another attempt?") and then the user's call. The
+nudge never throttles or locks; it's information.
+
 ## Calibration & preview mode
 
 `status.thresholds` reports the user's **personal baseline** — long-block alerts

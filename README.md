@@ -52,6 +52,38 @@ disabled. `burnout.py report` now renders a 14-day focus **sparkline** and a 7×
 **hour-of-day × day-of-week heatmap** so you can actually see where your focus is
 landing, plus all-time records: longest sprint and longest active-day streak.
 
+## Sprints, strain, projects (v5)
+
+The block + day model captures *now*. v5 captures *trajectory*: the multi-week
+sprint pattern that actually drives burnout.
+
+- **Multi-week strain** (Whoop-style debt model). 0–100 trajectory derived from
+  a rolling 30-day balance: hours over your typical daily pivot accumulate as
+  *debt*; light and rest days earn *recovery credit*. One bad week barely
+  registers; three of them get you to Critical. Surfaced as a banded advisory
+  in `status.strain` and `report`.
+- **Sprint declaration.** `burnout.py sprint declare --name "Q3 launch"
+  --until 2026-06-30` pre-commits you to a 1–21 day push. During: long-block
+  and heavy-day thresholds widen so the system stops crying wolf during work
+  you said you'd do. After: an automatic recovery window (half the sprint
+  length) with tighter heavy-day and a pulled-in lockout floor at index 60.
+  **Cancel queues 7 days** — same one-way ratchet as contracts.
+- **Per-project rollup.** Transcripts carry `cwd`, so `report` shows attention
+  by codebase. `burnout.py project mark --path X --deep-work` raises the
+  long-block thresholds by 1.25× when actively in that cwd. Lockout boundary
+  unaffected — deep work still has limits.
+- **Stuck-loop detection.** Conservative heuristic on recent prompt content:
+  if four near-duplicate prompts land in ten minutes, you get one console
+  nudge ("looks like a stuck loop, fresh perspective in ten minutes will land
+  more than another retry now"). Cannot trigger throttle or lockout. Half an
+  hour spiraling depletes more than two hours flowing — the engine should
+  notice.
+- **Recovery prescription.** Lockout exit is no longer just a timer. The
+  engine derives plain-language advice from your last sleep score, late-night
+  blocks, and current strain — *recovery suggested: a real night of sleep, a
+  no-Claude window tomorrow until midday, at least one fully off day in the
+  next 72h*.
+
 ## Personal calibration + pre-commitment contracts
 
 v4 rejects the "pick a profile" model that other wellbeing tools default to.
@@ -143,6 +175,12 @@ burnout.py checkin --exhaustion 3 --detachment 2 --efficacy 4 --sleep 2 --pressu
 burnout.py contract set --lockout-index 60 --stop-by 22 --max-daily-hours 4
 burnout.py contract show          # current contract + effective + resolved thresholds
 burnout.py contract clear         # 7-day cooling-off if it was tightening protection
+burnout.py sprint declare --name "Q3 launch" --until 2026-06-30 --rationale "..."
+burnout.py sprint show            # current sprint + phase + effective thresholds
+burnout.py sprint finish          # end early; recovery window starts now
+burnout.py sprint cancel          # 7-day cool-off; sprint stays active during it
+burnout.py project mark --path /path/to/repo --deep-work
+burnout.py project list           # top focus by cwd (last 7d) + flagged projects
 burnout.py defer --task "..."     # parking lot (L3+)
 burnout.py parked                 # list parked tasks
 burnout.py cooldown start --reason "self-imposed rest day"

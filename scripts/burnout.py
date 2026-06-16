@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v4: personal baseline, contracts, daily pulse,
-sustainable-rhythm streak, preview mode).
+burnout.py — Burnout Guard engine (v5: sprint-aware. Multi-week strain, sprint
+declaration, per-project rollup, conservative stuck detection, recovery
+prescription, legacy grind-streak removed).
 
 WHAT IT MEASURES (and deliberately doesn't)
   Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
@@ -152,6 +153,45 @@ PREVIEW_DAYS = 7
 PULSE_FRESH_HOURS = 24
 PULSE_TO_INDEX = {1: 5, 2: 25, 3: 50, 4: 75, 5: 90}   # 1=fresh, 5=fumes
 
+# Strain accumulation (v5) — Whoop-style "load - recovery" debt over 30 days.
+# A day under your typical load is recovery credit; a day over is debt. The score is
+# clamped against MAX_STRAIN_DEBT_HRS so a single bad week doesn't max it out, but
+# three of them will.
+STRAIN_LOOKBACK_DAYS = 30
+MAX_STRAIN_DEBT_HRS = 30          # cumulative hours over baseline → strain 100
+STRAIN_DEBT_BANDS = [             # (max_strain_value, label, instruction)
+    (39,  "Light",      "Strain trajectory is healthy."),
+    (59,  "Moderate",   "Strain is climbing — protect at least one recovery day this week."),
+    (79,  "High",       "Heavy 30-day strain — schedule a real day off in the next 72 hours."),
+    (100, "Critical",   "Sustained strain debt — back-to-back recovery days are owed and "
+                        "should be taken before another sprint."),
+]
+
+# Sprint declaration (v5) — committed effort window. During: thresholds relaxed
+# (you said you'd push, system stops crying wolf). After: auto post-recovery period
+# with tightened thresholds and lockout floor pulled in.
+SPRINT_DURING_HEAVY_DAY_MULT = 1.5     # 4h -> 6h, etc. Still clamped within bounds.
+SPRINT_DURING_BLOCK_MULT     = 1.3     # 90 -> ~117 min
+SPRINT_RECOVERY_RATIO        = 0.5     # post-recovery duration = sprint duration * this
+SPRINT_RECOVERY_HEAVY_MULT   = 0.7
+SPRINT_RECOVERY_LOCKOUT_IDX  = 60       # post-recovery lockout boundary
+SPRINT_CANCEL_COOLOFF_DAYS   = 7
+SPRINT_MAX_DAYS              = 21       # sanity cap on duration
+
+# Per-project rollup (v5)
+PROJECT_DEEP_WORK_MULT = 1.25         # raises long-block thresholds when active in flagged project
+
+# Stuck-loop detection (v5, conservative)
+STUCK_WINDOW_MIN     = 10             # look back this many minutes
+STUCK_MIN_PROMPTS    = 4              # need at least this many similar prompts
+STUCK_JACCARD_MEAN   = 0.5            # pairwise mean Jaccard threshold
+STUCK_BLOCK1_FRACTION = 0.6            # nudge fires at this fraction of long_block_1
+STUCK_REPEAT_MIN     = 30             # min minutes between stuck nudges
+
+# Recovery prescription (v5) — surfaced when in cooldown / on exit ritual.
+RECOVERY_GOOD_SLEEP    = 4            # sleep score (out of 5) considered restored
+RECOVERY_LATE_NIGHT_OK = 1            # >=N late blocks last 7d => prescribe a no-Claude window
+
 # ---------------------------------------------------------------- state io
 
 def now() -> datetime:
@@ -166,16 +206,17 @@ def parse(ts: str) -> datetime:
 def default_state() -> dict:
     created = now()
     return {
-        "version": 5,
-        "config": {"tone": "supportive"},
+        "version": 6,
+        "config": {"tone": "supportive", "stuck_detection": True},
         "created_at": iso(created),
         "preview_until": iso(created + timedelta(days=PREVIEW_DAYS)),
         "blocks": [],          # [{start, end, beats, late_night}] continuous work blocks
         "sessions": [],        # legacy/manual log-session entries (still honoured)
         "checkins": [],
         "pulses": [],          # [{ts, value}] daily 1-item burnout reading
-        "contract": None,      # {lockout_index?, stop_by_hour?, max_daily_hours?, set_at,
-                               #  last_modified, pending_loosening?}
+        "contract": None,      # {lockout_index?, stop_by_hour?, max_daily_hours?, ...}
+        "sprint": None,        # {name, started_at, until, recovery_until, pending_cancel?}
+        "projects": {},        # {path: {deep_work: bool, since: iso}}
         "cooldown": None,
         "parking_lot": [],
         "override_penalty": 0,
@@ -214,8 +255,18 @@ def load_state() -> dict:
             except Exception:
                 created_at = now()
             state["preview_until"] = iso(created_at + timedelta(days=PREVIEW_DAYS))
+    if v < 6:
+        state.setdefault("sprint", None)
+        state.setdefault("projects", {})
+        # Drop legacy grind streak fields (deprecated in v4, scheduled for v5/v6 removal).
+        rec = state.get("records") or {}
+        for legacy_key in ("longest_streak_days_alltime", "longest_streak_at",
+                           "current_streak_days"):
+            rec.pop(legacy_key, None)
+        state["records"] = rec
     state.setdefault("config", {"tone": "supportive"})
-    state["version"] = 5
+    state["config"].setdefault("stuck_detection", True)
+    state["version"] = 6
     return state
 
 def save_state(state: dict) -> None:
@@ -351,10 +402,11 @@ def unified_blocks(state: dict, days: int) -> list[dict]:
 # ---------------------------------------------------------------- records
 
 def update_records(state: dict, blocks: list[dict], thresh: dict) -> None:
-    """Track all-time longest sprint, legacy active-day streak (deprecated, kept until
-    v5), and sustainable-rhythm streak (the v4 metric we actually want). All updates
-    idempotent; thresholds come from the resolved baseline so 'no-blowout day' tracks
-    a personal definition, not the absolute defaults."""
+    """Track all-time longest sprint and sustainable-rhythm streak. The legacy
+    grind-streak metric (longest_streak_days_alltime) was removed in v5 — it was
+    rewarding the exact behaviour the tool exists to interrupt. Thresholds come
+    from the resolved baseline so 'no-blowout day' tracks a personal definition,
+    not the absolute defaults."""
     rec = state.setdefault("records", {})
     if blocks:
         longest = max(blocks, key=block_minutes)
@@ -362,17 +414,6 @@ def update_records(state: dict, blocks: list[dict], thresh: dict) -> None:
         if cur > rec.get("longest_block_min_alltime", 0):
             rec["longest_block_min_alltime"] = cur
             rec["longest_block_at"] = longest["end"]
-
-    # Legacy grind streak (deprecated in v4, drops in v5)
-    days_active = {parse(b["start"]).date() for b in blocks}
-    streak, d = 0, now().date()
-    while d in days_active:
-        streak += 1
-        d -= timedelta(days=1)
-    if streak > rec.get("longest_streak_days_alltime", 0):
-        rec["longest_streak_days_alltime"] = streak
-        rec["longest_streak_at"] = iso(now())
-    rec["current_streak_days"] = streak
 
     # Sustainable rhythm streak: a "good day" had work AND no block above
     # long_block_2 AND no late-night block. The metric we actually want to grow.
@@ -479,9 +520,12 @@ def settle_contract(state: dict) -> bool:
     audit(state, "contract_loosen_applied", json.dumps(pl.get("values", {})))
     return True
 
-def resolved_thresholds(state: dict) -> dict:
-    """Baseline thresholds, then tightened by contract where applicable. This is the
-    single source of truth that build_console_alerts and update_records consult."""
+def resolved_thresholds(state: dict, cwd: str | None = None) -> dict:
+    """Baseline → contract → sprint phase → deep-work-project. The single source of
+    truth for thresholds. Order matters: baseline first (personal), contracts tighten
+    only, sprint phase relaxes (during) or tightens (recovery), deep-work projects
+    only relax block-stretch alerts when actively working in them — never the
+    lockout boundary."""
     bl = baseline(state)
     out = {"long_block_1_min": bl["long_block_1_min"],
            "long_block_2_min": bl["long_block_2_min"],
@@ -490,17 +534,42 @@ def resolved_thresholds(state: dict) -> dict:
            "stop_by_hour":     LATE_NIGHT_START,
            "max_daily_hours":  bl["heavy_day_hours"],
            "calibrated":       bl["calibrated"],
-           "days_observed":    bl["days_observed"]}
+           "days_observed":    bl["days_observed"],
+           "sprint_phase":     sprint_phase(state),
+           "deep_work_active": is_deep_work_cwd(state, cwd)}
+
+    # Contracts can only tighten beyond defaults.
     c = effective_contract(state)
-    # Contracts can only tighten beyond defaults — they cannot weaken baseline.
     if "lockout_index" in c:
         out["lockout_index"] = min(out["lockout_index"], c["lockout_index"])
     if "stop_by_hour" in c:
         out["stop_by_hour"] = min(out["stop_by_hour"], c["stop_by_hour"])
     if "max_daily_hours" in c:
         out["max_daily_hours"] = min(out["max_daily_hours"], c["max_daily_hours"])
-        # contract-tightened heavy day also pulls the alert threshold down
         out["heavy_day_hours"] = min(out["heavy_day_hours"], c["max_daily_hours"])
+
+    # Sprint phase. During: relax block + heavy-day (you committed to push). Recovery:
+    # tighten heavy-day and pull lockout floor in. Both clamped within absolute bounds
+    # so sprint can't blow past 300-min long-block-2 or 8h heavy-day.
+    if out["sprint_phase"] == "active":
+        out["long_block_1_min"] = min(BASELINE_BOUNDS["long_block_1_min"][1],
+                                      int(out["long_block_1_min"] * SPRINT_DURING_BLOCK_MULT))
+        out["long_block_2_min"] = min(BASELINE_BOUNDS["long_block_2_min"][1],
+                                      int(out["long_block_2_min"] * SPRINT_DURING_BLOCK_MULT))
+        out["heavy_day_hours"] = min(BASELINE_BOUNDS["heavy_day_hours"][1],
+                                     out["heavy_day_hours"] * SPRINT_DURING_HEAVY_DAY_MULT)
+    elif out["sprint_phase"] == "recovery":
+        out["heavy_day_hours"] = max(BASELINE_BOUNDS["heavy_day_hours"][0],
+                                     out["heavy_day_hours"] * SPRINT_RECOVERY_HEAVY_MULT)
+        out["lockout_index"] = min(out["lockout_index"], SPRINT_RECOVERY_LOCKOUT_IDX)
+
+    # Deep-work project: relax block stretches only (not heavy-day, not lockout).
+    if out["deep_work_active"]:
+        out["long_block_1_min"] = min(BASELINE_BOUNDS["long_block_1_min"][1],
+                                      int(out["long_block_1_min"] * PROJECT_DEEP_WORK_MULT))
+        out["long_block_2_min"] = min(BASELINE_BOUNDS["long_block_2_min"][1],
+                                      int(out["long_block_2_min"] * PROJECT_DEEP_WORK_MULT))
+
     return out
 
 # ---------------------------------------------------------------- preview mode
@@ -513,6 +582,274 @@ def in_preview(state: dict) -> bool:
         return now() < parse(pu)
     except Exception:
         return False
+
+# ---------------------------------------------------------------- strain (v5)
+
+def daily_focus_hours(blocks: list[dict], days: int) -> dict:
+    """Return {date: focus_hours} over the trailing `days` days (UTC date keys)."""
+    today = now().date()
+    out = {today - timedelta(days=i): 0.0 for i in range(days)}
+    for b in blocks:
+        d = parse(b["start"]).date()
+        if d in out:
+            out[d] += block_minutes(b) / 60.0
+    return out
+
+def strain_score(state: dict) -> dict:
+    """Whoop-flavoured strain: a 30-day rolling debt of (load above your typical
+    daily) minus (recovery credit on light days). Distinct from the burnout index —
+    index is now (am I burnt out?), strain is trajectory (am I heading there?). Both
+    coexist in status/report; the SKILL.md tells Claude to surface them as different
+    things so users don't average them in their head."""
+    blocks = unified_blocks(state, days=STRAIN_LOOKBACK_DAYS)
+    bl = baseline(state)
+    # Use the user's heavy_day threshold as the "above your typical" reference. If
+    # uncalibrated, use the absolute default.
+    pivot_hours = bl["heavy_day_hours"]
+    daily = daily_focus_hours(blocks, STRAIN_LOOKBACK_DAYS)
+    debt_hours = 0.0
+    for hours in daily.values():
+        if hours > pivot_hours:
+            debt_hours += (hours - pivot_hours)            # accumulate above-load
+        elif hours == 0:
+            debt_hours -= 0.5                              # full rest day = small credit
+        elif hours < pivot_hours * 0.5:
+            debt_hours -= 0.25                             # light day = tiny credit
+    debt_hours = max(0.0, debt_hours)
+    score = round(min(100.0, (debt_hours / MAX_STRAIN_DEBT_HRS) * 100.0), 1)
+    band, instruction = STRAIN_DEBT_BANDS[-1][1], STRAIN_DEBT_BANDS[-1][2]
+    for cap, label, advice in STRAIN_DEBT_BANDS:
+        if score <= cap:
+            band, instruction = label, advice
+            break
+    return {"score": score, "band": band, "debt_hours": round(debt_hours, 1),
+            "pivot_hours": pivot_hours, "instruction": instruction,
+            "lookback_days": STRAIN_LOOKBACK_DAYS}
+
+# ---------------------------------------------------------------- sprint (v5)
+
+def sprint_phase(state: dict) -> str:
+    """One of: 'none', 'active', 'recovery', 'cancel_pending'."""
+    sp = state.get("sprint")
+    if not sp:
+        return "none"
+    n = now()
+    if sp.get("pending_cancel") and parse(sp["pending_cancel"]["applies_at"]) > n:
+        # Cancel queued — but during the cool-off the sprint stays active so the user
+        # can finish what they committed to. Cancel takes effect after the cool-off.
+        return "active" if parse(sp["until"]) > n else "recovery"
+    if parse(sp["until"]) > n:
+        return "active"
+    if parse(sp.get("recovery_until", sp["until"])) > n:
+        return "recovery"
+    return "none"   # finished naturally; cleared on next save by settle_sprint
+
+def settle_sprint(state: dict) -> bool:
+    """Apply matured cancels and clear naturally-finished sprints. Returns True if
+    state was mutated. Called from save paths."""
+    sp = state.get("sprint")
+    if not sp:
+        return False
+    n = now()
+    pending = sp.get("pending_cancel")
+    if pending and parse(pending["applies_at"]) <= n:
+        audit(state, "sprint_cancel_applied", sp.get("name", ""))
+        state["sprint"] = None
+        return True
+    if not pending and parse(sp.get("recovery_until", sp["until"])) <= n:
+        audit(state, "sprint_finished", sp.get("name", ""))
+        state["sprint"] = None
+        return True
+    return False
+
+# ---------------------------------------------------------------- projects (v5)
+
+def transcript_blocks_by_project(cutoff: datetime) -> dict[str, list[dict]]:
+    """Group transcript-derived beats by cwd, then stitch into per-project blocks.
+    Heartbeat-only blocks (no cwd) aren't bucketable here — they appear in totals
+    but not in the per-project breakdown."""
+    by_cwd: dict[str, list[datetime]] = {}
+    if not TRANSCRIPTS_ROOT.exists() or not TRANSCRIPTS_ROOT.is_dir():
+        return {}
+    file_floor = (now() - timedelta(days=TRANSCRIPT_LOOKBACK_DAYS)).timestamp()
+    files: list[Path] = []
+    try:
+        for proj in TRANSCRIPTS_ROOT.iterdir():
+            if not proj.is_dir():
+                continue
+            try:
+                for jsonl in proj.glob("*.jsonl"):
+                    try:
+                        if jsonl.stat().st_mtime >= file_floor:
+                            files.append(jsonl)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    except OSError:
+        return {}
+    if len(files) > TRANSCRIPT_MAX_FILES:
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        files = files[:TRANSCRIPT_MAX_FILES]
+
+    for jsonl in files:
+        try:
+            with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"type":"user"' not in line and '"type": "user"' not in line:
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except Exception:
+                        continue
+                    if ev.get("type") != "user":
+                        continue
+                    msg = ev.get("message") or {}
+                    if not isinstance(msg.get("content"), str):
+                        continue
+                    dt = parse_iso_z(ev.get("timestamp", ""))
+                    if dt is None or dt < cutoff:
+                        continue
+                    cwd = ev.get("cwd") or "(unknown)"
+                    by_cwd.setdefault(cwd, []).append(dt)
+        except (OSError, IOError):
+            continue
+
+    out: dict[str, list[dict]] = {}
+    for cwd, beats in by_cwd.items():
+        beats.sort()
+        items = [(t, t, 1, is_late(t.astimezone())) for t in beats]
+        out[cwd] = stitch_intervals(items)
+    return out
+
+def project_summary(state: dict, days: int = 7) -> list[dict]:
+    """Top projects by trailing focus minutes, with deep-work flag. Best-effort."""
+    cutoff = now() - timedelta(days=days)
+    by_proj = transcript_blocks_by_project(cutoff)
+    rows = []
+    for cwd, blocks in by_proj.items():
+        recent = [b for b in blocks if parse(b["end"]) >= cutoff]
+        if not recent:
+            continue
+        total_min = sum(block_minutes(b) for b in recent)
+        flag = (state.get("projects") or {}).get(cwd, {}).get("deep_work", False)
+        rows.append({"path": cwd, "minutes_7d": round(total_min, 1),
+                     "blocks_7d": len(recent),
+                     "deep_work": flag,
+                     "longest_block_min": round(max((block_minutes(b) for b in recent),
+                                                   default=0), 1)})
+    rows.sort(key=lambda r: r["minutes_7d"], reverse=True)
+    return rows
+
+def is_deep_work_cwd(state: dict, cwd: str | None) -> bool:
+    if not cwd:
+        return False
+    p = (state.get("projects") or {}).get(cwd)
+    return bool(p and p.get("deep_work"))
+
+# ---------------------------------------------------------------- stuck loop (v5)
+
+def _word_set(s: str) -> set[str]:
+    return {w for w in (s.lower().split()) if len(w) >= 3}
+
+def _jaccard(a: set, b: set) -> float:
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+def detect_stuck_loop(prompts_recent: list[str]) -> bool:
+    """Conservative spiral detector: pairwise mean Jaccard of word sets across the
+    recent prompts. Designed to err toward false negatives — being wrong with a
+    'looks like a loop' nudge is fine; being wrong with a lockout is not. Returns
+    False below STUCK_MIN_PROMPTS so a single repeat never trips it."""
+    if len(prompts_recent) < STUCK_MIN_PROMPTS:
+        return False
+    sets = [_word_set(p) for p in prompts_recent if p]
+    if len(sets) < STUCK_MIN_PROMPTS:
+        return False
+    pairs = []
+    for i in range(len(sets)):
+        for j in range(i + 1, len(sets)):
+            pairs.append(_jaccard(sets[i], sets[j]))
+    if not pairs:
+        return False
+    return (sum(pairs) / len(pairs)) >= STUCK_JACCARD_MEAN
+
+def recent_transcript_prompts(window_min: int) -> list[str]:
+    """Best-effort: read the most recent transcript prompts within the time window.
+    Returns [] on any error."""
+    try:
+        cutoff = now() - timedelta(minutes=window_min)
+        prompts: list[tuple[datetime, str]] = []
+        if not TRANSCRIPTS_ROOT.exists():
+            return []
+        # Only scan the few most recently modified jsonl files — recent prompts live
+        # in the active session's jsonl, scanning all is overkill for a hint.
+        all_files: list[Path] = []
+        for proj in TRANSCRIPTS_ROOT.iterdir():
+            if not proj.is_dir():
+                continue
+            for jsonl in proj.glob("*.jsonl"):
+                try:
+                    all_files.append(jsonl)
+                except OSError:
+                    continue
+        all_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for jsonl in all_files[:6]:
+            try:
+                with jsonl.open("r", encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if '"type":"user"' not in line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except Exception:
+                            continue
+                        if ev.get("type") != "user":
+                            continue
+                        msg = ev.get("message") or {}
+                        c = msg.get("content")
+                        if not isinstance(c, str):
+                            continue
+                        dt = parse_iso_z(ev.get("timestamp", ""))
+                        if dt is None or dt < cutoff:
+                            continue
+                        prompts.append((dt, c))
+            except (OSError, IOError):
+                continue
+        prompts.sort()
+        return [p for _, p in prompts]
+    except Exception:
+        return []
+
+# ---------------------------------------------------------------- recovery rx (v5)
+
+def recovery_prescription(state: dict) -> dict:
+    """Plain-language recovery suggestion, surfaced in cooldown_status and
+    timer-elapsed messages. Derived from observable signal: last sleep score, late-
+    night blocks last 7d, current strain. Intentionally simple — not medical."""
+    bd_blocks = unified_blocks(state, days=7)
+    late_n = sum(1 for b in bd_blocks if b.get("late_night"))
+    last_sleep = None
+    if state.get("checkins"):
+        last_sleep = state["checkins"][-1].get("sleep")
+    sl = strain_score(state)
+    lines: list[str] = []
+    if last_sleep is None or last_sleep < RECOVERY_GOOD_SLEEP:
+        lines.append("a real night of sleep (8h target; phone out of room)")
+    if late_n >= RECOVERY_LATE_NIGHT_OK:
+        lines.append(f"a no-Claude window tomorrow until midday "
+                     f"(you logged {late_n} late-night block{'s' if late_n != 1 else ''} "
+                     "last 7 days)")
+    if sl["score"] >= 60:
+        lines.append("at least one fully off day in the next 72h before another sprint")
+    if not lines:
+        lines.append("light contact (status/checkin only) until the timer elapses, "
+                     "then a fresh check-in — you may already be there")
+    return {"strain": sl, "items": lines,
+            "summary": "Recovery suggested: " + "; ".join(lines) + "."}
 
 # ---------------------------------------------------------------- behaviour
 
@@ -765,14 +1102,14 @@ def msg(state: dict, key: str, **kw) -> str:
     return MSG[key][t].format(**kw)
 
 def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
-                         prompt: str = "") -> dict:
+                         prompt: str = "", cwd: str | None = None) -> dict:
     """Returns hook-output JSON: a block decision, a systemMessage alert, or {}.
 
-    Thresholds are personal (baseline + contract floor) once enough days are
-    observed; until then they fall back to absolute defaults. During preview mode
-    (first 7 days from install) L4/L5 surface as warnings instead of platform-
-    blocking the prompt — meant to ease day-one users into the system."""
-    thresh = resolved_thresholds(state)
+    Thresholds resolve through baseline → contract → sprint phase → deep-work
+    project (cwd-aware). During preview mode (first 7 days from install) L4/L5
+    surface as warnings instead of platform-blocking. Stuck-loop detection is
+    conservative: console nudge only, never throttles or locks."""
+    thresh = resolved_thresholds(state, cwd=cwd)
 
     # Deliberate-act passthrough: conversation, exit ritual, parking, emergencies.
     if cd["locked"] and prompt.strip().lower().startswith(PASS_PREFIXES):
@@ -842,6 +1179,22 @@ def build_console_alerts(state: dict, block: dict, score: dict, cd: dict,
        and alert_due(state, "latenight", 120):
         msgs.append(msg(state, "latenight"))
 
+    # 6) Stuck-loop nudge (conservative, console-only, never affects index/lockout).
+    if state.get("config", {}).get("stuck_detection", True):
+        stuck_threshold = thresh["long_block_1_min"] * STUCK_BLOCK1_FRACTION
+        if mins >= stuck_threshold and alert_due(state, "stuck", STUCK_REPEAT_MIN):
+            recent = recent_transcript_prompts(STUCK_WINDOW_MIN)
+            if detect_stuck_loop(recent[-8:]):
+                msgs.append("🧯 Looks like a stuck loop — several near-duplicate "
+                            "prompts in the last few minutes. A fresh perspective "
+                            "in 10 minutes will land more than another retry now.")
+
+    # 7) Sprint-phase context line (rate-limited; just a quiet status reminder).
+    sp = thresh["sprint_phase"]
+    if sp == "recovery" and alert_due(state, "sprint_recovery", 240):
+        msgs.append("🧯 Post-sprint recovery window — heavy-day threshold is tight; "
+                    "this is the rest you committed to.")
+
     if msgs:
         return {"systemMessage": " ".join(msgs)}
     return {}
@@ -856,10 +1209,13 @@ def cmd_heartbeat(args):
         except Exception:
             hook_input = {}
         state = load_state()
+        settle_sprint(state)
+        settle_contract(state)
         block = record_beat(state)
         score = compute_index(state)
         maybe_escalate(state, score, "heartbeat")
         cd = cooldown_status(state)
+        cwd = hook_input.get("cwd") if isinstance(hook_input, dict) else None
 
         if args.event == "session-start":
             bd = score["behaviour_detail"]
@@ -884,8 +1240,8 @@ def cmd_heartbeat(args):
             out = {}                      # silent: just extends the block
         else:                             # user-prompt-submit (default)
             prompt = hook_input.get("prompt", "") if isinstance(hook_input, dict) else ""
-            out = build_console_alerts(state, block, score, cd, prompt) if args.hook \
-                  else {"beat": True, "score": score, "cooldown": cd}
+            out = build_console_alerts(state, block, score, cd, prompt, cwd=cwd) \
+                  if args.hook else {"beat": True, "score": score, "cooldown": cd}
         save_state(state)
         print(json.dumps(out))
     except Exception as e:
@@ -897,9 +1253,12 @@ def cmd_heartbeat(args):
 def cmd_status(args):
     state = load_state()
     settle_contract(state)
+    settle_sprint(state)
     score = compute_index(state)
     cd = cooldown_status(state)
     thresh = resolved_thresholds(state)
+    strain = strain_score(state)
+    rx = recovery_prescription(state) if cd["locked"] else None
     if cd["locked"]:
         effective, verdict, code = max(score["level"], cd["lock_level"], 4), "LOCKED", 10
     elif score["level"] == 3:
@@ -912,9 +1271,13 @@ def cmd_status(args):
                       "verdict": verdict, "tone": tone_of(state),
                       "records": state.get("records", {}),
                       "thresholds": thresh,
+                      "strain": strain,
+                      "sprint": state.get("sprint"),
+                      "sprint_phase": sprint_phase(state),
                       "contract": effective_contract(state) or None,
                       "preview_mode": in_preview(state),
                       "preview_until": state.get("preview_until"),
+                      "recovery": rx,
                       "instruction": LEVEL_INSTRUCTIONS[effective]},
                      indent=2))
     sys.exit(code)
@@ -1058,6 +1421,120 @@ def cmd_override(args):
                                 "for THIS task, then the lockout resumes. "
                                 f"+{OVERRIDE_PENALTY} penalty until next calm check-in."},
                      indent=2))
+
+def cmd_sprint(args):
+    """Declare or end a sprint. During: thresholds relax (you committed to push, the
+    system stops crying wolf). After: an automatic post-recovery period with tighter
+    heavy-day and a pulled-in lockout floor. Cancel queues for 7 days — the sprint
+    you committed to on Sunday isn't dissolved at 11pm Wednesday."""
+    state = load_state()
+    settle_sprint(state)
+
+    if args.action == "show":
+        sp = state.get("sprint")
+        thr = resolved_thresholds(state)
+        print(json.dumps({"sprint": sp, "phase": sprint_phase(state),
+                          "effective_thresholds": thr}, indent=2))
+        return
+
+    if args.action == "finish":
+        sp = state.get("sprint")
+        if not sp:
+            print(json.dumps({"finished": False, "detail": "no active sprint"}, indent=2))
+            return
+        if sprint_phase(state) == "active":
+            # Finishing early skips straight to recovery. The recovery window starts
+            # now and lasts (work-already-done * SPRINT_RECOVERY_RATIO).
+            elapsed = (now() - parse(sp["started_at"]))
+            sp["until"] = iso(now())
+            sp["recovery_until"] = iso(now() + elapsed * SPRINT_RECOVERY_RATIO)
+            audit(state, "sprint_finish_early", sp.get("name", ""))
+        save_state(state)
+        print(json.dumps({"finished": True, "phase": sprint_phase(state),
+                          "sprint": state.get("sprint")}, indent=2))
+        return
+
+    if args.action == "cancel":
+        sp = state.get("sprint")
+        if not sp:
+            print(json.dumps({"cancelled": False, "detail": "no active sprint"}, indent=2))
+            return
+        sp["pending_cancel"] = {
+            "requested_at": iso(now()),
+            "applies_at": iso(now() + timedelta(days=SPRINT_CANCEL_COOLOFF_DAYS)),
+        }
+        audit(state, "sprint_cancel_queued", sp.get("name", ""))
+        save_state(state)
+        print(json.dumps({"queued": True,
+                          "detail": f"cancel will apply in {SPRINT_CANCEL_COOLOFF_DAYS} days; "
+                                    "until then the sprint stays active so you can finish what "
+                                    "you committed to. The queue is the feature.",
+                          "applies_at": sp["pending_cancel"]["applies_at"]}, indent=2))
+        return
+
+    # declare
+    if state.get("sprint") and sprint_phase(state) != "none":
+        print("error: a sprint is already active or in recovery; finish or cancel it first",
+              file=sys.stderr)
+        sys.exit(2)
+    if not args.name or len(args.name.strip()) < 3:
+        print("error: --name required (at least 3 chars)", file=sys.stderr)
+        sys.exit(2)
+    if not args.until:
+        print("error: --until DATE (YYYY-MM-DD) required", file=sys.stderr)
+        sys.exit(2)
+    try:
+        until_dt = datetime.fromisoformat(args.until).replace(tzinfo=timezone.utc)
+    except Exception:
+        print("error: --until must be YYYY-MM-DD", file=sys.stderr)
+        sys.exit(2)
+    if until_dt <= now():
+        print("error: --until must be in the future", file=sys.stderr)
+        sys.exit(2)
+    duration_days = (until_dt - now()).days + 1
+    if duration_days > SPRINT_MAX_DAYS:
+        print(f"error: sprint capped at {SPRINT_MAX_DAYS} days. If the work is longer "
+              f"than that, it is not a sprint, it is a project — and projects need "
+              f"weekly recovery, not 'I'll rest after.'", file=sys.stderr)
+        sys.exit(2)
+    recovery_until = until_dt + (until_dt - now()) * SPRINT_RECOVERY_RATIO
+    state["sprint"] = {
+        "name": args.name.strip(),
+        "started_at": iso(now()),
+        "until": iso(until_dt),
+        "recovery_until": iso(recovery_until),
+        "rationale": (args.rationale or "").strip() or None,
+    }
+    audit(state, "sprint_declare",
+          f"{args.name.strip()} until {args.until} (recovery until {iso(recovery_until)})")
+    save_state(state)
+    print(json.dumps({"declared": True, "sprint": state["sprint"],
+                      "phase": "active",
+                      "effective_thresholds": resolved_thresholds(state)}, indent=2))
+
+def cmd_project(args):
+    """Mark a project (cwd path) as deep-work — long-block thresholds widen by
+    PROJECT_DEEP_WORK_MULT when actively in that cwd. Lockout boundary unaffected."""
+    state = load_state()
+    if args.action == "list":
+        ps = project_summary(state, days=7)
+        flagged = (state.get("projects") or {})
+        print(json.dumps({"top_by_focus_7d": ps, "flagged": flagged}, indent=2))
+        return
+    if not args.path:
+        print("error: --path required", file=sys.stderr)
+        sys.exit(2)
+    path = args.path.strip()
+    projects = state.setdefault("projects", {})
+    if args.action == "mark":
+        projects[path] = {"deep_work": bool(args.deep_work),
+                          "since": iso(now())}
+        audit(state, "project_mark", f"{path} deep_work={bool(args.deep_work)}")
+    elif args.action == "unmark":
+        projects.pop(path, None)
+        audit(state, "project_unmark", path)
+    save_state(state)
+    print(json.dumps({"projects": projects}, indent=2))
 
 def cmd_pulse(args):
     """Daily 1-item burnout reading. Cheap to log every day; smooths self-report."""
@@ -1270,6 +1747,9 @@ def cmd_report(args):
     pulses_14 = [p for p in state.get("pulses", []) if parse(p["ts"]) >= cutoff]
     thresh = resolved_thresholds(state)
     eff_contract = effective_contract(state)
+    strain = strain_score(state)
+    proj_top = project_summary(state, days=7)[:5]
+    sp = state.get("sprint")
 
     cal_line = (f"**Calibration:** personal baseline ({thresh['days_observed']} days observed) — "
                 f"long-block alerts at {thresh['long_block_1_min']}/{thresh['long_block_2_min']} min, "
@@ -1302,8 +1782,6 @@ def cmd_report(args):
         f"{rec.get('sustainable_rhythm_streak_current', 0)} day(s) current, "
         f"{rec.get('sustainable_rhythm_streak_alltime', 0)} day(s) all-time — "
         "days with work AND no over-long block AND no late-night block",
-        f"- ~~Longest active-day streak: {rec.get('longest_streak_days_alltime', 0)} day(s)~~ "
-        f"(deprecated; rewards grinding — drops in v5)",
         f"\n## Self-report",
         f"- Daily pulses (14d): {len(pulses_14)}"
         + (f", latest: {pulses_14[-1]['value']}/5 ({pulses_14[-1]['ts']})" if pulses_14 else ""),
@@ -1314,6 +1792,29 @@ def cmd_report(args):
         lines.append(f"- Latest check-in ({last['ts']}): exhaustion {last['exhaustion']}/5, "
                      f"detachment {last['detachment']}/5, efficacy {last['efficacy']}/5, "
                      f"sleep {last['sleep']}/5, pressure {last['pressure']}/5")
+    lines.append(f"\n## Strain (30-day debt model)")
+    lines.append(f"- {strain['band']} — {strain['score']}/100 "
+                 f"(debt {strain['debt_hours']}h vs {strain['pivot_hours']}h/day pivot)")
+    lines.append(f"- {strain['instruction']}")
+
+    if sp:
+        lines.append(f"\n## Sprint")
+        lines.append(f"- {sp.get('name', 'unnamed')} — phase: **{sprint_phase(state)}** "
+                     f"(until {sp.get('until','?')}, recovery until "
+                     f"{sp.get('recovery_until','?')})")
+        if sp.get("rationale"):
+            lines.append(f"- rationale: {sp['rationale']}")
+        if sp.get("pending_cancel"):
+            lines.append(f"- cancel queued, applies at {sp['pending_cancel']['applies_at']}")
+
+    if proj_top:
+        lines.append(f"\n## By project (top 5, last 7 days)")
+        for p in proj_top:
+            short = p["path"].split("/")[-1] or p["path"]
+            mark = " [deep-work]" if p["deep_work"] else ""
+            lines.append(f"- {short}{mark} — {p['minutes_7d']} min, "
+                         f"{p['blocks_7d']} block(s), longest {p['longest_block_min']} min")
+
     if eff_contract:
         lines.append(f"\n## Contract (pre-commitments)")
         for f in CONTRACT_FIELDS:
@@ -1323,6 +1824,11 @@ def cmd_report(args):
         if pl:
             lines.append(f"- pending loosening applies at {pl['applies_at']}: "
                          f"{json.dumps(pl.get('values', {}))}")
+
+    if cd["locked"]:
+        rx = recovery_prescription(state)
+        lines.append(f"\n## Recovery prescription")
+        lines.append(f"- {rx['summary']}")
     lines += [f"\n## Enforcement\n- Lockouts triggered (14d): {len(lockouts)}",
               f"- Parking lot: {len(state['parking_lot'])} item(s)",
               f"- Override penalty in effect: +{state.get('override_penalty', 0)}",
@@ -1471,6 +1977,25 @@ def main():
     pl.add_argument("value", type=int, help="1-5")
     pl.add_argument("--note", type=str, default="")
     pl.set_defaults(fn=cmd_pulse)
+
+    sp = sub.add_parser("sprint",
+                        help="declare a sprint (relaxed during, auto-recovery after); "
+                             "cancel queues 7 days")
+    sp.add_argument("action", choices=["declare", "show", "finish", "cancel"])
+    sp.add_argument("--name", type=str, default=None)
+    sp.add_argument("--until", type=str, default=None,
+                    help="YYYY-MM-DD (last day of sprint, inclusive)")
+    sp.add_argument("--rationale", type=str, default=None,
+                    help="optional: what you're shipping and why now")
+    sp.set_defaults(fn=cmd_sprint)
+
+    pr = sub.add_parser("project",
+                        help="mark/unmark/list projects; deep-work flag widens block "
+                             "thresholds when active in that cwd")
+    pr.add_argument("action", choices=["mark", "unmark", "list"])
+    pr.add_argument("--path", type=str, default=None)
+    pr.add_argument("--deep-work", action="store_true")
+    pr.set_defaults(fn=cmd_project)
 
     co = sub.add_parser("contract",
                         help="pre-commitment device — tighten now, loosening waits 7 days")
