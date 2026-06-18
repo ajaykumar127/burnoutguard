@@ -1,5 +1,53 @@
 # Changelog
 
+## v6.0.0 — 2026-06-19
+
+**Pi-aware: a second local agent platform.** Burnout Guard now measures human
+attention time across both Claude Code AND the [Pi coding agent](https://github.com/earendil-works),
+with a single shared engine. Contributed by **@johnny2678** ([#1](https://github.com/ajaykumar127/burnoutguard/issues/1) /
+[#2](https://github.com/ajaykumar127/burnoutguard/pull/2)) — thoughtful PR
+that explicitly preserved the "engine is source of truth" design.
+
+- **New top-level `integrations/` directory** for non-Claude-Code platform
+  ports. The Claude integration stays at the repo root; everything else lives
+  here so future ports (Cursor, Aider, …) have a clear home.
+- **Pi integration (`integrations/pi/`):**
+  - `skill/SKILL.md` — Pi skill that mirrors the Claude protocol exactly: same
+    six levels, same `bg:` channel, same exit ritual, same crisis carve-out.
+    Engine is unchanged; only the platform integration differs.
+  - `extension/burnout-guard.ts` — TypeScript Pi extension. Faithful relay,
+    not a second brain: invents no thresholds, only translates the engine's
+    verdict into Pi behaviour. Records heartbeats, surfaces console alerts,
+    blocks mutating tools (`bash`/`write`/`edit`) at L4/L5 lockouts. Fail-open
+    invariant: engine missing or erroring never blocks a tool, never crashes
+    a turn.
+  - `install.sh` — idempotent global installer that renders absolute engine
+    paths into the skill + extension. State at `~/.burnout-guard/state.json`
+    is preserved across install/uninstall.
+  - `README.md` — full setup, behaviour, and env-config docs.
+- **Engine: optional second beat source.** `pi_session_beats(cutoff)` mirrors
+  the existing `transcript_beats(cutoff)` for `~/.pi/agent/sessions/**/*.jsonl`,
+  with `PI_SESSIONS_PATH` override and the same lookback/file caps. Honours
+  Pi's block-style content shape, filters auto-injected skill/template blocks
+  via `PI_INJECTION_PREFIXES` and `source` markers. **Inert when the Pi
+  sessions directory does not exist** — Claude-only users see zero behaviour
+  change.
+- **Merge point.** One additional loop in `unified_blocks()`:
+  ```py
+  for t in pi_session_beats(cutoff):
+      items.append((t, t, 1, is_late(t.astimezone())))
+  ```
+  All v3.2 transcript handling, v4 baseline/contracts/pulse, v5 strain/
+  sprint/projects/stuck/recovery features apply unchanged across both
+  platforms — the engine just sees more beats.
+
+### Why a major version
+
+No breaking changes — the engine change is purely additive and Claude-only
+users see no behaviour difference. We bump major because the *scope* expands
+from "Claude Code wellbeing tool" to "local-agent wellbeing tool, multi-
+platform." New top-level directory, second platform, second skill artefact.
+
 ## v5.0.0 — 2026-06-16
 
 **The sprint-aware release.** Burnout Guard now thinks in weeks, not just blocks.

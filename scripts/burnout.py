@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v5: sprint-aware. Multi-week strain, sprint
-declaration, per-project rollup, conservative stuck detection, recovery
-prescription, legacy grind-streak removed).
+burnout.py — Burnout Guard engine (v6: Pi-aware. v5's sprint/strain/projects
+features are unchanged; v6 adds a second optional local beat source — the Pi
+coding agent's session transcripts — feeding the same engine. Pi is inert
+unless ~/.pi/agent/sessions exists, so Claude-only users see no change).
 
 WHAT IT MEASURES (and deliberately doesn't)
   Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
