@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+**Pi compatibility.**
+
+- Added a Pi integration under `integrations/pi/`: install helper, Pi skill, TypeScript
+  extension, and setup documentation.
+- Added Pi session transcripts at `~/.pi/agent/sessions/**/*.jsonl` as an optional
+  second local beat source, merged alongside Claude Code transcripts. The reader is
+  best-effort, stdlib-only, capped by the existing transcript lookback/file limits,
+  and inert when the Pi sessions directory does not exist.
+- The Pi extension relays the existing engine verdict into Pi: prompt heartbeats,
+  session posture context, console alerts, and platform-level blocking of mutating
+  tools during L4/L5 lockouts while preserving the `bg:` escape channel.
+
 ## v3.2.0 — 2026-06-12
 
 **Transcript signal, all-time records, CLI graphs.**

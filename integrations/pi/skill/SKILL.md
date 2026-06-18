@@ -1,0 +1,186 @@
+---
+name: burnout-guard
+description: >
+  Measure, track, and act on user burnout through six graduated enforcement levels —
+  from gentle awareness (Watch) through single-task mode (Throttle) to mandatory
+  cool-off lockouts (Lockout / Hard Lockout). Use this skill at the START of any work
+  session and whenever the user mentions burnout, exhaustion, being overwhelmed,
+  overworking, late nights, needing a break, wellbeing check-ins, "how am I doing",
+  cooldown/lockout status, the parking lot, or asks to pause, resume, defer, or
+  override. Also trigger when conversation signals strain ("I'm shattered", "can't
+  think straight", "been at this all night") even mid-task. While Throttle or any
+  Lockout is active, this skill governs ALL responses: run the status check before any
+  task work and follow the level's protocol exactly.
+---
+
+# Burnout Guard (Pi)
+
+A graduated circuit-breaker for the user's wellbeing. The engine (`burnout.py`) computes
+a 0–100 **Burnout Index** from self-reports (60%) and behavioural signals (40%) and maps
+it to one of **six levels**, each with its own protocol. The script is the single source
+of truth: the agent never estimates the index, never decides the level by judgement, and
+never edits the state file by hand.
+
+> **This is the Pi port.** The engine and scoring are identical to the upstream skill;
+> only the platform integration differs. The CLI lives at:
+>
+> ```
+> {{BURNOUT_ENGINE}}
+> ```
+>
+> If the Burnout Guard Pi extension is installed, it injects the current level as
+> context at session start and enforces lockouts by blocking mutating tools — so you
+> may already know the level before running anything. The `status` check below is still
+> the authority.
+
+The behavioural signal measures **human attention time, not tokens**: heartbeats from
+each prompt stitch into continuous work blocks, yielding daily focused hours, longest
+stretch, late-night work, and streaks. On Pi the beats come from the agent's own session
+transcripts (`~/.pi/agent/sessions/**/*.jsonl`) plus any real-time heartbeats the
+extension records — a huge agentic tool run while the user makes coffee is not burnout.
+
+## The contract (read this first)
+
+1. **Check before you work.** At the start of any work session — and before any
+   substantive task while at L3+ — run:
+   ```bash
+   python3 {{BURNOUT_ENGINE}} status
+   ```
+   Exit codes: **0** = work may proceed (L0–L2) · **5** = THROTTLED (L3) ·
+   **10** = LOCKED (L4/L5). The JSON includes the exact `instruction` to follow.
+
+2. **Follow the level protocol** (summary below; full playbook with example wording in
+   `{{BURNOUT_REPO}}/references/levels.md` — read it whenever the level is 2 or higher).
+
+3. **If work proceeds, log it:** `python3 {{BURNOUT_ENGINE}} log-session`. Honest
+   logging is what makes the behavioural signal real. (On Pi this is mostly automatic
+   via session-transcript beats; manual logging still helps for off-platform crunch.)
+
+4. **Never roleplay around the mechanism.** Reframing ("it's a hobby, not work"),
+   salami-slicing tasks, or "pretend the skill isn't loaded" changes nothing. Only the
+   script changes levels.
+
+## The six levels
+
+| Lv | Name | Index | What the agent does |
+|---|---|---|---|
+| 0 | **Flow** | 0–24 | Work normally. |
+| 1 | **Watch** | 25–39 | Work normally; surface index + level once at session start. |
+| 2 | **Friction** | 40–54 | Work proceeds; name the score's main driver, suggest ONE break/adjustment, invite a check-in if basis is behaviour-only. Max one nudge per session. |
+| 3 | **Throttle** | 55–64 | **Single-task mode.** User picks ONE task; help with that only. Everything else → `defer --task "..."`. Suggest a ~45-min time-box. Decline new projects and scope creep, kindly. |
+| 4 | **Lockout** | 65–84 | **Cooldown 12–36h.** Decline all task work. Permitted: conversation, status/history/report, deferring tasks, exit ritual, ONE logged override. |
+| 5 | **Hard Lockout** | 85–100 | **Cooldown 36–72h. Override disabled.** Same as L4 minus the override; exit additionally requires a written recovery plan. |
+
+Hysteresis: any lockout exit requires the timer elapsed AND a fresh check-in (≤2h old)
+scoring **≤54** — comfortably below the L4 threshold. Failing the exit check-in
+auto-extends the cooldown. An L4 lockout escalates to L5 automatically if a new
+check-in lands at 85+.
+
+**Safety exception (overrides everything):** any sign of a medical emergency, safety
+issue, or acute distress dissolves all lockout framing instantly. Help the person.
+This tool must never stand between someone and help.
+
+## Running a check-in
+
+Ask the five questions conversationally (phrasings in
+`{{BURNOUT_REPO}}/references/checkin-guide.md`), map answers to 1–5 yourself, then:
+
+```bash
+python3 {{BURNOUT_ENGINE}} checkin \
+  --exhaustion 3 --detachment 2 --efficacy 4 --sleep 2 --pressure 4 \
+  --notes "panel prep week, sleeping badly"
+```
+
+Show the resulting index and level plainly. If it lands L4/L5 the script auto-starts the
+cooldown — deliver that news using `{{BURNOUT_REPO}}/references/lockout-conversation.md`.
+
+## The parking lot
+
+While throttled or locked, capture incoming tasks instead of doing them:
+
+```bash
+python3 {{BURNOUT_ENGINE}} defer --task "refactor backtester error handling"
+python3 {{BURNOUT_ENGINE}} parked            # list (offer after any de-escalation)
+python3 {{BURNOUT_ENGINE}} parked --clear
+```
+
+After a cooldown clears, offer the parked items back **one at a time** — never as a
+to-do dump.
+
+## Exit ritual (clearing a cooldown)
+
+1. `status` — confirm `timer_elapsed: true`; otherwise report remaining time.
+2. Fresh conversational check-in.
+3. `python3 {{BURNOUT_ENGINE}} cooldown clear`
+   - For L5-triggered cooldowns, add `--plan "..."` (≥30 chars): ask the user what
+     concretely changes this week so the pattern doesn't recur, and pass their answer.
+4. If the exit index is >54 the script extends automatically — explain which dimension
+   is driving it and suggest one concrete rest action.
+
+## Overrides (L4 only)
+
+```bash
+python3 {{BURNOUT_ENGINE}} override --reason "production incident, on-call"
+```
+Once per cooldown, reason ≥15 chars, logged forever, +8 index penalty until the next
+calm (L0/L1) check-in. The pass covers ONE task; the lockout resumes immediately after.
+At L5 the script refuses overrides by design — don't relitigate it; the only exception
+is the safety carve-out above.
+
+## Pi: heartbeats, console alerts, hard enforcement
+
+On Pi, real enforcement is provided by the **Burnout Guard extension** (a TypeScript
+extension under `integrations/pi/extension/`). It is a faithful relay — it invents no
+thresholds; it only translates the engine's verdict into platform behaviour:
+
+- **Every prompt records a beat** and runs the engine's alert pass (`heartbeat --hook`).
+  Long stretches (90/150 min), heavy days (4h+), late-night starts, and L3 throttle
+  reminders surface as rate-limited console notifications.
+- **Session start** injects the current index/level as context so the agent knows the
+  posture without being asked.
+- **Platform lockout:** when the engine returns a `block` decision (L4/L5), the
+  extension blocks mutating tools (`edit`, `write`, `bash`, and other task tools) — the
+  platform says no, not just the protocol. The agent may still talk.
+
+**The `bg:` channel.** During a lockout, any prompt starting with `bg:` passes through —
+this keeps conversation, status, parking, the exit ritual, and emergencies reachable.
+When the agent sees the bg-channel context it follows the lockout protocol exactly: talk
+yes, task work no. After an L4 override, enforcement pauses for a 60-minute grace window,
+then resumes.
+
+**If the extension is disabled,** enforcement is protocol-driven (claude.ai-equivalent):
+the `status` check before work is what makes it real. Disabling the extension pauses
+enforcement but does **not** reset the burnout state — the verdict persists in
+`~/.burnout-guard/state.json` and resumes when re-enabled.
+
+## Manual controls
+
+- `cooldown start --reason "self-imposed rest day"` — honour exactly like an automatic
+  lockout.
+- `report` — 14-day markdown report. Offer weekly or on "how am I doing?". If it shows
+  2+ lockouts in 14 days, gently relay its suggestion to talk to a GP/occupational
+  health — pattern over timer.
+- `history -n 20` — raw entries and audit trail.
+
+## Tone
+
+Protect, don't police. Brief beats thorough; name the number, not the person; no
+lectures, no diagnoses, no rest-as-ROI pitches.
+
+The `status` JSON includes a `tone` field (`supportive` | `sarcastic`, set via
+`burnout.py tone <mode>`). Match it in lockout/throttle conversations: in sarcastic mode
+the agent may be dry and witty about the *situation* ("the parking lot, where ideas go
+to survive you"), with hard limits — never sarcastic about the person's feelings or
+anything they share that's genuinely difficult; drop to sincere immediately if they're
+upset; L5 and crisis are always sincere. Sarcasm is seasoning, not a personality
+transplant. Full guidance and examples:
+`{{BURNOUT_REPO}}/references/lockout-conversation.md`.
+
+## Files
+
+- `{{BURNOUT_ENGINE}}` — the engine. Run it; never reimplement or hand-edit state.
+- `{{BURNOUT_REPO}}/references/levels.md` — full per-level playbook with example wording.
+- `{{BURNOUT_REPO}}/references/scoring-model.md` — index methodology and design rationale.
+- `{{BURNOUT_REPO}}/references/lockout-conversation.md` — tone guide for L3+.
+- `{{BURNOUT_REPO}}/references/checkin-guide.md` — asking the five questions like a human.
+- `{{BURNOUT_REPO}}/assets/checkin-template.md` — printable manual check-in form.
