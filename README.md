@@ -158,7 +158,16 @@ git clone https://github.com/<you>/burnout-guard ~/.claude/skills/burnout-guard
 
 # Claude.ai / Desktop: download burnout-guard.skill from Releases,
 # upload via Settings → Capabilities → Skills
+
+# Pi coding agent (v6+)
+git clone https://github.com/<you>/burnout-guard ~/Projects/burnout-guard
+~/Projects/burnout-guard/integrations/pi/install.sh
+# then run /reload inside a Pi session
 ```
+
+The same engine drives both platforms; if you have both Claude Code and Pi
+installed, beats from both feed the single attention-time signal. See
+[`integrations/pi/`](integrations/pi/README.md) for the Pi extension setup.
 
 Then just work. Say *"let's do a check-in"* when you're curious. Full walkthrough,
 scenarios, tuning guide and FAQ: **[docs/GUIDE.md](docs/GUIDE.md)**.
