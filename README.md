@@ -111,14 +111,14 @@ wrong moment. Instead:
 - **Preview mode.** First 7 days from install, L4/L5 surface as warnings instead
   of platform-blocking. Day-one users meet the system gradually.
 
-## Real enforcement + console alerts in Claude Code
+## Real enforcement + console alerts in Claude Code only
 
 ```bash
 python3 scripts/burnout.py hook install
 ```
 
 One command wires the engine into Claude Code's hooks (settings preserved, backup
-written). From then on:
+written). This command is **only for Claude Code**. From then on:
 
 - **Console alerts**, right in your terminal, rate-limited:
   - `🧯 100 minutes continuous — good moment for a short break.`
@@ -134,6 +134,13 @@ written). From then on:
   urgent or personal stay reachable during a lockout. Claude still won't do task work
   there; it's a door for the person, not the to-do list.
 - **SessionStart context** so Claude knows your level the moment a session opens.
+
+Pi users do **not** run `burnout.py hook install`. For Pi,
+`./integrations/pi/install.sh` installs a Pi extension instead. The extension uses Pi
+lifecycle events for the equivalent behavior: session-start context injection,
+per-prompt heartbeat recording, console alerts, and L4/L5 mutating-tool blocking.
+After running the Pi installer, enable the extension in the current Pi session with
+`/reload`, or restart Pi.
 
 On claude.ai (no hooks), enforcement is deterministic-by-protocol: the skill requires
 Claude to run `burnout.py status` before task work and binds it to the script's
@@ -154,16 +161,32 @@ a person and help.
 ```bash
 # Claude Code
 mkdir -p ~/.claude/skills
-git clone https://github.com/<you>/burnout-guard ~/.claude/skills/burnout-guard
+git clone https://github.com/ajaykumar127/burnoutguard ~/.claude/skills/burnout-guard
+python3 ~/.claude/skills/burnout-guard/scripts/burnout.py hook install
 
 # Claude.ai / Desktop: download burnout-guard.skill from Releases,
 # upload via Settings → Capabilities → Skills
 
 # Pi coding agent (v6+)
-git clone https://github.com/<you>/burnout-guard ~/Projects/burnout-guard
-~/Projects/burnout-guard/integrations/pi/install.sh
-# then run /reload inside a Pi session
+git clone https://github.com/ajaykumar127/burnoutguard /tmp/burnout-guard
+cd /tmp/burnout-guard
+./integrations/pi/install.sh
+
+# Enable the extension in Pi:
+# - if Pi is already running, type /reload
+# - otherwise, start Pi normally
 ```
+
+The Pi installer copies two files into Pi's global auto-discovery locations:
+
+- `~/.pi/agent/skills/burnout-guard/SKILL.md`
+- `~/.pi/agent/extensions/burnout-guard.ts`
+
+Pi auto-loads extensions from `~/.pi/agent/extensions/`. There is no Python hook
+enabler for Pi. Enable the newly installed extension with `/reload` in an existing
+session, or by starting a new Pi session. `install.sh` renders the absolute path of
+the checkout you ran it from, so if you remove a temporary `/tmp/burnout-guard`
+checkout later, reinstall from the new checkout location.
 
 The same engine drives both platforms; if you have both Claude Code and Pi
 installed, beats from both feed the single attention-time signal. See

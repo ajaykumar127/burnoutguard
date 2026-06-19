@@ -42,7 +42,7 @@ this puts a speed bump exactly there.
 **Claude Code:**
 ```bash
 mkdir -p ~/.claude/skills
-git clone https://github.com/<you>/burnout-guard ~/.claude/skills/burnout-guard
+git clone https://github.com/ajaykumar127/burnoutguard ~/.claude/skills/burnout-guard
 ```
 
 **Claude.ai / Claude Desktop:** download `burnout-guard.skill` from the
