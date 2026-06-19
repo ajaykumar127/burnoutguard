@@ -17,11 +17,29 @@ The port mirrors the three layers of the Claude Code integration:
 ## Quick start
 
 ```bash
-git clone https://github.com/<you>/burnout-guard ~/Projects/burnout-guard
-cd ~/Projects/burnout-guard
-./integrations/pi/install.sh        # installs the skill + extension globally
-# then run /reload inside a Pi session
+git clone https://github.com/ajaykumar127/burnoutguard /tmp/burnout-guard
+cd /tmp/burnout-guard
+./integrations/pi/install.sh
 ```
+
+Then enable it in Pi:
+
+- If Pi is already running: type `/reload`
+- If Pi is not running: start Pi normally
+
+Pi users do **not** run `burnout.py hook install`; that hook installer is for Claude
+Code only. The Pi installer installs a Pi extension instead.
+
+`install.sh` installs globally into Pi's auto-discovery paths:
+
+- skill: `~/.pi/agent/skills/burnout-guard/SKILL.md`
+- extension: `~/.pi/agent/extensions/burnout-guard.ts`
+
+Pi loads global extensions automatically. `/reload` enables the newly installed
+extension in an already-running session; a new Pi session loads it at startup.
+`install.sh` renders the absolute path of the checkout you ran it from, so if you
+remove a temporary `/tmp/burnout-guard` checkout later, reinstall from the new
+checkout location.
 
 Uninstall (state preserved): `./integrations/pi/install.sh uninstall` + `/reload`.
 
