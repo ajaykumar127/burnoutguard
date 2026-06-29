@@ -8,9 +8,11 @@ description: >
   overworking, late nights, needing a break, wellbeing check-ins, "how am I doing",
   cooldown/lockout status, the parking lot, or asks to pause, resume, defer, or
   override. Also trigger when conversation signals strain ("I'm shattered", "can't
-  think straight", "been at this all night") even mid-task. While Throttle or any
-  Lockout is active, this skill governs ALL responses: run the status check before any
-  task work and follow the level's protocol exactly.
+  think straight", "been at this all night") even mid-task, or when the user mentions
+  sleep, rest quality, meeting load, calendar load, Whoop / Oura / Apple Health, or
+  asks why their strain moved. While Throttle or any Lockout is active, this skill
+  governs ALL responses: run the status check before any task work and follow the
+  level's protocol exactly.
 ---
 
 # Burnout Guard
@@ -149,6 +151,36 @@ Strain bands: `Light` (0–39, healthy), `Moderate` (40–59, climbing), `High`
 (60–79, schedule a real day off in 72h), `Critical` (80–100, recovery owed
 before another sprint). Mention the band when discussing the level — it
 explains why the protocol feels stricter than the index alone would suggest.
+
+## Body signals (sleep + calendar, optional)
+
+`status.strain.body_signals` is the v7 layer. It is **only populated when the
+user has configured a provider** — otherwise the engine math is identical to
+v6 and there's nothing to surface. When present:
+
+- `sleep_today` — last night's record `{date, hours, quality 0-100, source}`.
+- `sleep_today_category` — `good` / `neutral` / `poor` / `null`.
+- `today_pivot_hours` vs `base_pivot_hours` — how sleep shifted today's
+  daily focus pivot. Good night raises it (more forgiving); poor night
+  lowers it (same hours = more debt).
+- `calendar` — today's meeting load if `today.ics` was present.
+- `sleep_window` — counts of good / poor / neutral / no-data nights over the
+  30-day strain window.
+
+Surface this when the user mentions sleep, energy, or asks why strain moved.
+*"Your strain ticked up partly because the engine sees Tuesday's poor sleep
+narrowing your effective pivot — same hours, harder landing."* When the user
+asks for an explanation, suggest `burnout.py status --explain` (stderr trace).
+
+**Do not blame the user for poor sleep.** The data is a context for the
+verdict, not a judgement. Avoid *"you should sleep more"* — say *"the
+engine treated yesterday as a tighter pivot day because of how you slept,
+which is why a 5-hour session registered as high load"*.
+
+If a meeting day shows high `calendar.meeting_hours` and the user is asking
+why they "feel done" despite low AI session time, name the meeting load —
+3 hours of focus + 4 hours of meetings is a full day, even if the burnout
+behaviour signal looks light.
 
 ## Per-project context
 

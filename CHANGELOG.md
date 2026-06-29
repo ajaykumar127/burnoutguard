@@ -1,5 +1,68 @@
 # Changelog
 
+## v7.0.0 — 2026-06-29
+
+**Body-aware: sleep and calendar feed the engine.** Burnout Guard now reads
+optional sleep and calendar signals to ask a sharper question — not just
+"how hard did you work?" but "how hard did that work land, given how you
+slept and how much of your day was meetings?". Same engine, more inputs.
+
+- **New `scripts/providers/` module** with a small pluggable Provider
+  protocol. All three providers normalize to a single `SleepRecord(date,
+  hours, quality 0-100, source)` so the engine compares devices on one axis.
+  Per-provider/per-date cache with a 4-hour TTL keeps `status` cheap.
+  - `apple_health.py` — file-based, no auth, no network. Reads
+    `~/.burnout-guard/sleep/apple_health.json` populated by an iOS Shortcut
+    (or `burnout.py sleep record` for manual entry).
+  - `oura.py` — Personal Access Token auth. Prefers daily readiness score
+    for quality; falls back to a composite of efficiency + restless periods.
+    Stdlib `urllib` only.
+  - `whoop.py` — OAuth 2.0 + PKCE with a one-shot localhost callback. Uses
+    `score.sleep_performance_percentage` directly (already 0-100). Refresh
+    token handled transparently.
+- **Calendar load** (`scripts/calendar_load.py`). Drops in
+  `~/.burnout-guard/calendar/today.ics`; small VEVENT parser (stdlib only,
+  no `icalendar` dep). Meeting hours + back-to-back stretches feed strain
+  as additional debt, not focus — a 6-hour meeting day is taxing even with
+  zero code written.
+- **Engine integration in `strain_score`:**
+  - Per-day pivot adjusts by sleep classification: good night → +10%
+    forgiveness; poor night → −15% tightening; neutral / no data → unchanged.
+    Same focus hours land harder when you're underslept.
+  - Good nights award explicit `SLEEP_RECOVERY_CREDIT` toward debt reduction
+    — so the v5 debt model finally rewards sleep, not just light work days.
+  - Today's calendar `meeting_hours` and `longest_b2b_min` add to debt,
+    weighted by `CAL_MEETING_STRAIN_PER_HR` and `CAL_BACK_TO_BACK_PENALTY_PER_HR`.
+  - All effects gate on data presence. Users with no provider configured
+    and no `today.ics` get **identical math to v6** — the only diff is a
+    `body_signals: {providers_enabled: []}` block in status output.
+- **New CLI:**
+  - `burnout.py sleep connect apple_health | oura | whoop [...]` — provider
+    setup, with `--token` (Oura) or `--client-id`/`--client-secret` (Whoop).
+  - `burnout.py sleep status | sync | disable | record` — inspection,
+    forced re-fetch, removal, manual entry.
+  - `burnout.py calendar [show]` — debug ICS parsing without running status.
+  - `burnout.py status --explain` — stderr trace of how sleep + calendar
+    shifted today's pivot and debt. Useful for tuning.
+- **State layout** under `~/.burnout-guard/`:
+  - `auth/providers.json` — enabled provider list + priority order.
+  - `auth/oura.json`, `auth/whoop.json` — provider tokens (chmod 600 manually).
+  - `sleep/cache.json` — per-provider/per-date sleep records.
+  - `sleep/apple_health.json` — Apple Health source-of-truth (Shortcut-managed).
+  - `calendar/today.ics` — daily calendar export.
+- **Reference: `references/sleep-tuning.md`** documents every constant, the
+  quality-axis mapping across providers, a tuning loop, and the deliberate
+  choice NOT to auto-learn sleep thresholds.
+
+### Why a major version
+
+No breaking changes. The engine math is **bit-identical to v6** when no
+provider is enabled and no calendar file is present — that's the test we
+ran first. But v7 expands the *scope* from "agent-attention wellbeing tool"
+to "body-and-meeting-aware wellbeing tool". New module tree, new state
+directories, new CLI surface, new providers/oauth dependencies (stdlib only,
+but real network code now). That earns a major.
+
 ## v6.0.0 — 2026-06-19
 
 **Pi-aware: a second local agent platform.** Burnout Guard now measures human

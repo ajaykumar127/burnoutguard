@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """
-burnout.py — Burnout Guard engine (v6: Pi-aware. v5's sprint/strain/projects
-features are unchanged; v6 adds a second optional local beat source — the Pi
-coding agent's session transcripts — feeding the same engine. Pi is inert
-unless ~/.pi/agent/sessions exists, so Claude-only users see no change).
+burnout.py — Burnout Guard engine (v7: body-aware. v5's sprint/strain/projects
+and v6's Pi support are unchanged; v7 adds optional sleep providers (Apple
+Health, Oura, Whoop) and a today.ics calendar reader that feed the strain
+trajectory metric — the burnout index itself is untouched. Inert when no
+provider is configured and no calendar file is present, so existing users
+see identical math to v6).
 
 WHAT IT MEASURES (and deliberately doesn't)
   Burnout Guard measures HUMAN ATTENTION TIME, not tokens. Tokens measure Claude's
@@ -51,9 +53,10 @@ CLAUDE CODE INTEGRATION (real enforcement + console alerts)
     - Stop -> silent heartbeat so blocks reflect full turns.
 
 Subcommands:
-  status | log-session | checkin | pulse N | contract set/show/clear |
+  status [--explain] | log-session | checkin | pulse N | contract set/show/clear |
   defer | parked | cooldown start/clear | override | tone | history | report |
-  heartbeat [--hook] [--event NAME] | hook install|uninstall|status
+  heartbeat [--hook] [--event NAME] | hook install|uninstall|status |
+  sleep connect|status|sync|disable|record | calendar [show]
 
 State: ~/.burnout-guard/state.json (override with BURNOUT_GUARD_HOME).
 Exit codes: 0 work may proceed (L0-L2), 5 THROTTLED (L3), 10 LOCKED (L4/L5), 2 usage.
@@ -69,6 +72,14 @@ import os
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+# v7 body-signal modules — optional providers and calendar load. Imported here so
+# the engine and its CLI share one set of types; the modules are fail-soft (every
+# fetch path returns None on any error) so import never affects engine behaviour
+# when nothing is configured.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import providers as _providers              # noqa: E402
+import calendar_load as _calendar_load      # noqa: E402
 
 # ---------------------------------------------------------------- constants
 
@@ -200,6 +211,19 @@ STUCK_REPEAT_MIN     = 30             # min minutes between stuck nudges
 # Recovery prescription (v5) — surfaced when in cooldown / on exit ritual.
 RECOVERY_GOOD_SLEEP    = 4            # sleep score (out of 5) considered restored
 RECOVERY_LATE_NIGHT_OK = 1            # >=N late blocks last 7d => prescribe a no-Claude window
+
+# Body signals (v7) — optional sleep + calendar inputs. ALL effects gate on a
+# record being available; users with no provider configured see no behaviour
+# change vs v6. Thresholds documented in references/sleep-tuning.md.
+SLEEP_GOOD_HOURS         = 7.0     # ≥ this AND quality ≥ good → restorative night
+SLEEP_GOOD_QUALITY       = 70.0
+SLEEP_POOR_HOURS         = 6.0     # < this OR quality < poor → debt-amplifying night
+SLEEP_POOR_QUALITY       = 50.0
+SLEEP_PIVOT_GOOD_MULT    = 1.10    # well-rested: pivot is more forgiving
+SLEEP_PIVOT_POOR_MULT    = 0.85    # tired: same focus hours land harder
+SLEEP_RECOVERY_CREDIT    = 0.5     # extra strain-debt reduction after a good night
+CAL_MEETING_STRAIN_PER_HR     = 0.15   # 6 meeting-hrs ≈ ~1 hr focus-equivalent debt
+CAL_BACK_TO_BACK_PENALTY_PER_HR = 0.10  # extra debt for unbroken meeting stretches
 
 # ---------------------------------------------------------------- state io
 
@@ -679,26 +703,106 @@ def daily_focus_hours(blocks: list[dict], days: int) -> dict:
             out[d] += block_minutes(b) / 60.0
     return out
 
+# ------------------------------------------------------- body signals (v7)
+#
+# Two helpers consumed by strain_score and cmd_status. Both return the empty
+# / null shape when nothing is configured, so engine math stays identical to
+# v6 in that case. Records are attributed to the WAKE date.
+
+def sleep_classify(rec) -> str:
+    """Categorise a SleepRecord as 'good', 'poor', or 'neutral'."""
+    if rec is None:
+        return "neutral"
+    if rec.hours >= SLEEP_GOOD_HOURS and rec.quality >= SLEEP_GOOD_QUALITY:
+        return "good"
+    if rec.hours < SLEEP_POOR_HOURS or rec.quality < SLEEP_POOR_QUALITY:
+        return "poor"
+    return "neutral"
+
+def sleep_pivot_mult(rec) -> float:
+    cat = sleep_classify(rec)
+    if cat == "good":
+        return SLEEP_PIVOT_GOOD_MULT
+    if cat == "poor":
+        return SLEEP_PIVOT_POOR_MULT
+    return 1.0
+
+def collect_sleep_history(days: int) -> dict:
+    """Return {date: SleepRecord|None} for the trailing `days` days. Inert when
+    no providers are enabled — returns a dict of Nones quickly. Per-day lookups
+    are cached by the providers module so we don't hammer external APIs."""
+    if not _providers.enabled():
+        return {}
+    today = now().date()
+    out: dict = {}
+    for i in range(days):
+        d = today - timedelta(days=i)
+        try:
+            out[d] = _providers.get_sleep_record(d)
+        except Exception:
+            out[d] = None
+    return out
+
+def calendar_summary() -> dict | None:
+    """Today's meeting load, or None when no ICS file is present."""
+    cal = _calendar_load.load_today()
+    return cal.to_dict() if cal else None
+
+def calendar_strain_debt(cal: dict | None) -> float:
+    """Convert meeting load into focus-equivalent debt hours added on top of
+    AI-session strain. Today-only because the ICS export is today.ics."""
+    if not cal:
+        return 0.0
+    meet = float(cal.get("meeting_hours", 0.0))
+    b2b = float(cal.get("longest_b2b_min", 0)) / 60.0
+    return (meet * CAL_MEETING_STRAIN_PER_HR
+            + b2b * CAL_BACK_TO_BACK_PENALTY_PER_HR)
+
 def strain_score(state: dict) -> dict:
     """Whoop-flavoured strain: a 30-day rolling debt of (load above your typical
     daily) minus (recovery credit on light days). Distinct from the burnout index —
     index is now (am I burnt out?), strain is trajectory (am I heading there?). Both
     coexist in status/report; the SKILL.md tells Claude to surface them as different
-    things so users don't average them in their head."""
+    things so users don't average them in their head.
+
+    v7: when sleep data is available, the daily pivot shifts up after a good
+    night (more forgiving) and down after a poor night (same focus hours land
+    harder), and a good night earns an explicit recovery credit. When a
+    today.ics is present, meeting load adds to today's debt. All v7 effects
+    gate on data presence — no provider configured ≡ v6 math exactly."""
     blocks = unified_blocks(state, days=STRAIN_LOOKBACK_DAYS)
     bl = baseline(state)
     # Use the user's heavy_day threshold as the "above your typical" reference. If
     # uncalibrated, use the absolute default.
-    pivot_hours = bl["heavy_day_hours"]
+    base_pivot = bl["heavy_day_hours"]
     daily = daily_focus_hours(blocks, STRAIN_LOOKBACK_DAYS)
+    sleep_hist = collect_sleep_history(STRAIN_LOOKBACK_DAYS)
     debt_hours = 0.0
-    for hours in daily.values():
-        if hours > pivot_hours:
-            debt_hours += (hours - pivot_hours)            # accumulate above-load
+    sleep_adjustments = {"good_nights": 0, "poor_nights": 0,
+                         "neutral_nights": 0, "no_data_nights": 0}
+    for d, hours in daily.items():
+        rec = sleep_hist.get(d)
+        pivot = base_pivot * sleep_pivot_mult(rec)
+        cat = sleep_classify(rec) if rec else None
+        if cat == "good":
+            sleep_adjustments["good_nights"] += 1
+        elif cat == "poor":
+            sleep_adjustments["poor_nights"] += 1
+        elif cat == "neutral" and rec is not None:
+            sleep_adjustments["neutral_nights"] += 1
+        else:
+            sleep_adjustments["no_data_nights"] += 1
+        if hours > pivot:
+            debt_hours += (hours - pivot)                  # accumulate above-load
         elif hours == 0:
             debt_hours -= 0.5                              # full rest day = small credit
-        elif hours < pivot_hours * 0.5:
+        elif hours < pivot * 0.5:
             debt_hours -= 0.25                             # light day = tiny credit
+        if cat == "good":
+            debt_hours -= SLEEP_RECOVERY_CREDIT            # explicit good-rest credit
+    cal = calendar_summary()
+    cal_debt = calendar_strain_debt(cal)
+    debt_hours += cal_debt
     debt_hours = max(0.0, debt_hours)
     score = round(min(100.0, (debt_hours / MAX_STRAIN_DEBT_HRS) * 100.0), 1)
     band, instruction = STRAIN_DEBT_BANDS[-1][1], STRAIN_DEBT_BANDS[-1][2]
@@ -706,9 +810,21 @@ def strain_score(state: dict) -> dict:
         if score <= cap:
             band, instruction = label, advice
             break
+    today_rec = sleep_hist.get(now().date()) if sleep_hist else None
+    body = {
+        "sleep_today": today_rec.to_dict() if today_rec else None,
+        "sleep_today_category": sleep_classify(today_rec) if today_rec else None,
+        "today_pivot_hours": round(base_pivot * sleep_pivot_mult(today_rec), 2),
+        "base_pivot_hours": round(base_pivot, 2),
+        "calendar": cal,
+        "calendar_debt_hours": round(cal_debt, 2),
+        "sleep_window": sleep_adjustments,
+        "providers_enabled": _providers.enabled(),
+    }
     return {"score": score, "band": band, "debt_hours": round(debt_hours, 1),
-            "pivot_hours": pivot_hours, "instruction": instruction,
-            "lookback_days": STRAIN_LOOKBACK_DAYS}
+            "pivot_hours": base_pivot, "instruction": instruction,
+            "lookback_days": STRAIN_LOOKBACK_DAYS,
+            "body_signals": body}
 
 # ---------------------------------------------------------------- sprint (v5)
 
@@ -1364,7 +1480,50 @@ def cmd_status(args):
                       "recovery": rx,
                       "instruction": LEVEL_INSTRUCTIONS[effective]},
                      indent=2))
+    if getattr(args, "explain", False):
+        print("\n--- body signals trace (v7) ---", file=sys.stderr)
+        for line in explain_body_signals(strain):
+            print(line, file=sys.stderr)
     sys.exit(code)
+
+def explain_body_signals(strain: dict) -> list[str]:
+    """Human-readable trace of how sleep/calendar shifted today's strain.
+    Returned as a list so callers can stream to stderr or join for display."""
+    body = strain.get("body_signals", {})
+    lines: list[str] = []
+    en = body.get("providers_enabled") or []
+    if not en:
+        lines.append("Sleep: no provider enabled — engine using base pivot only.")
+    else:
+        rec = body.get("sleep_today")
+        cat = body.get("sleep_today_category") or "no data"
+        if rec:
+            lines.append(f"Sleep last night: {rec['hours']}h · quality {rec['quality']} "
+                         f"· source {rec['source']} → category '{cat}'.")
+        else:
+            lines.append(f"Sleep last night: no record from {', '.join(en)}.")
+        base = body.get("base_pivot_hours")
+        today = body.get("today_pivot_hours")
+        if base is not None and today is not None and base:
+            shift_pct = (today / base - 1.0) * 100
+            verb = "raised" if shift_pct > 0 else ("lowered" if shift_pct < 0 else "unchanged")
+            lines.append(f"Today's focus pivot: {today}h (base {base}h, {verb} by "
+                         f"{abs(shift_pct):.0f}% based on sleep).")
+        win = body.get("sleep_window", {})
+        lines.append(f"30-day sleep window: {win.get('good_nights', 0)} good · "
+                     f"{win.get('poor_nights', 0)} poor · "
+                     f"{win.get('neutral_nights', 0)} neutral · "
+                     f"{win.get('no_data_nights', 0)} no data.")
+    cal = body.get("calendar")
+    if cal is None:
+        lines.append("Calendar: no today.ics found — meeting load not factored.")
+    else:
+        lines.append(f"Calendar today: {cal['meeting_count']} meetings · "
+                     f"{cal['meeting_hours']}h total · "
+                     f"longest back-to-back {cal['longest_b2b_min']} min "
+                     f"(+{body.get('calendar_debt_hours', 0)}h debt).")
+    lines.append(f"Strain {strain.get('score')} / 100 (band: {strain.get('band')}).")
+    return lines
 
 def cmd_log_session(args):
     state = load_state()
@@ -1924,6 +2083,139 @@ def cmd_report(args):
     save_state(state)
     print("\n".join(lines))
 
+def cmd_sleep(args):
+    """`sleep connect|status|sync|disable|record` — manage body-signal providers."""
+    action = args.action
+    if action == "status":
+        from datetime import date as date_cls
+        en = _providers.enabled()
+        avail = _providers.available()
+        today = date_cls.today()
+        details = []
+        for name in avail:
+            entry = {"name": name, "enabled": name in en}
+            if name in en:
+                try:
+                    rec = _providers._PROVIDERS[name].fetch(today)
+                    entry["latest_today"] = rec.to_dict() if rec else None
+                except Exception as e:
+                    entry["error"] = str(e)
+            details.append(entry)
+        print(json.dumps({"enabled": en, "available": avail,
+                          "providers": details}, indent=2))
+        return
+
+    if action == "connect":
+        name = args.provider
+        if name not in _providers.available():
+            print(f"error: unknown provider '{name}'. Choices: "
+                  f"{', '.join(_providers.available())}", file=sys.stderr)
+            sys.exit(2)
+        if name == "oura":
+            if not args.token:
+                print("error: --token required for oura connect", file=sys.stderr)
+                sys.exit(2)
+            from providers import oura as _oura
+            _oura.save_token(args.token)
+        elif name == "whoop":
+            if not (args.client_id and args.client_secret):
+                print("error: --client-id and --client-secret required for whoop connect.\n"
+                      "Register an app at https://developer.whoop.com/ and set the "
+                      f"redirect URI to http://localhost:{args.port}/callback",
+                      file=sys.stderr)
+                sys.exit(2)
+            from providers import whoop as _whoop
+            try:
+                _whoop.connect(args.client_id, args.client_secret, port=args.port)
+            except RuntimeError as e:
+                print(f"error: whoop oauth failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        elif name == "apple_health":
+            from providers.base import SLEEP_DIR
+            SLEEP_DIR.mkdir(parents=True, exist_ok=True)
+            src = SLEEP_DIR / "apple_health.json"
+            if not src.exists():
+                src.write_text(json.dumps({"records": []}, indent=2))
+        _providers.enable(name)
+        print(json.dumps({"connected": name, "enabled": _providers.enabled(),
+                          "detail": f"Provider {name} configured. "
+                                    "Run `sleep sync` to fetch today's record."},
+                         indent=2))
+        return
+
+    if action == "disable":
+        name = args.provider
+        _providers.disable(name)
+        print(json.dumps({"disabled": name, "enabled": _providers.enabled()},
+                         indent=2))
+        return
+
+    if action == "sync":
+        from datetime import date as date_cls
+        from providers.base import cache_put  # force a fresh fetch by clearing
+        today = date_cls.today()
+        results = {}
+        for name in _providers.enabled():
+            mod = _providers._PROVIDERS.get(name)
+            if not mod:
+                continue
+            cache_put(name, today.isoformat(), None)  # invalidate
+            try:
+                rec = mod.fetch(today)
+                results[name] = rec.to_dict() if rec else None
+            except Exception as e:
+                results[name] = {"error": str(e)}
+        print(json.dumps({"synced": results}, indent=2))
+        return
+
+    if action == "record":
+        # Manual override: write into apple_health.json so downstream reads
+        # find it through the existing apple_health provider. Useful when
+        # offline or for sanity-checking the engine.
+        if args.hours is None:
+            print("error: --hours required for manual record", file=sys.stderr)
+            sys.exit(2)
+        from providers.base import SLEEP_DIR, cache_put
+        SLEEP_DIR.mkdir(parents=True, exist_ok=True)
+        target = (datetime.fromisoformat(args.date).date() if args.date
+                  else datetime.now().date())
+        # Invalidate the cache for this date across ALL providers — a manual
+        # rewrite must show up immediately, not after CACHE_TTL_HOURS elapses.
+        for p in _providers.available():
+            cache_put(p, target.isoformat(), None)
+        src = SLEEP_DIR / "apple_health.json"
+        data = json.loads(src.read_text()) if src.exists() else {"records": []}
+        records = data.get("records") if isinstance(data, dict) else data
+        if records is None:
+            records = []
+            data = {"records": records}
+        records = [r for r in records if r.get("date") != target.isoformat()]
+        records.append({"date": target.isoformat(),
+                        "hours": float(args.hours),
+                        "quality": float(args.quality if args.quality is not None else 65.0)})
+        records.sort(key=lambda r: r["date"])
+        data["records"] = records[-180:]   # cap at 6 months of nights
+        src.write_text(json.dumps(data, indent=2))
+        if "apple_health" not in _providers.enabled():
+            _providers.enable("apple_health")
+        print(json.dumps({"recorded": records[-1]}, indent=2))
+        return
+
+    print(f"error: unknown sleep action '{action}'", file=sys.stderr)
+    sys.exit(2)
+
+def cmd_calendar(args):
+    """`calendar show` — debug ICS parsing without running full status."""
+    cal = _calendar_load.load_today()
+    if cal is None:
+        print(json.dumps({"configured": False,
+                          "path": str(_calendar_load.ICS_FILE),
+                          "detail": "Drop today's calendar export at this path "
+                                    "(stdlib ICS parser, no recurrence expansion)."},
+                         indent=2))
+        return
+    print(json.dumps({"configured": True, "load": cal.to_dict()}, indent=2))
+
 def cmd_tone(args):
     state = load_state()
     if args.mode == "show":
@@ -2012,7 +2304,11 @@ def main():
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status").set_defaults(fn=cmd_status)
+    st = sub.add_parser("status")
+    st.add_argument("--explain", action="store_true",
+                    help="also print a human-readable trace of how sleep/calendar "
+                         "shifted today's strain (v7)")
+    st.set_defaults(fn=cmd_status)
     sub.add_parser("log-session").set_defaults(fn=cmd_log_session)
 
     hb = sub.add_parser("heartbeat")
@@ -2097,6 +2393,32 @@ def main():
     hi.set_defaults(fn=cmd_history)
 
     sub.add_parser("report").set_defaults(fn=cmd_report)
+
+    sl = sub.add_parser("sleep",
+                        help="connect/sync sleep providers (apple_health, oura, whoop)")
+    sl.add_argument("action",
+                    choices=["connect", "status", "sync", "disable", "record"])
+    sl.add_argument("provider", nargs="?", default=None,
+                    help="apple_health | oura | whoop (for connect/disable)")
+    sl.add_argument("--token", type=str, default=None,
+                    help="oura personal access token")
+    sl.add_argument("--client-id", type=str, default=None, dest="client_id",
+                    help="whoop OAuth client id")
+    sl.add_argument("--client-secret", type=str, default=None, dest="client_secret",
+                    help="whoop OAuth client secret")
+    sl.add_argument("--port", type=int, default=8765,
+                    help="local callback port for whoop OAuth (default 8765)")
+    sl.add_argument("--hours", type=float, default=None,
+                    help="manual record: sleep hours")
+    sl.add_argument("--quality", type=float, default=None,
+                    help="manual record: 0-100 quality (defaults to 65)")
+    sl.add_argument("--date", type=str, default=None,
+                    help="manual record: ISO date (defaults to today)")
+    sl.set_defaults(fn=cmd_sleep)
+
+    cl = sub.add_parser("calendar", help="show parsed calendar load from today.ics")
+    cl.add_argument("action", choices=["show"], default="show", nargs="?")
+    cl.set_defaults(fn=cmd_calendar)
 
     args = p.parse_args()
     args.fn(args)

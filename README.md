@@ -111,6 +111,51 @@ wrong moment. Instead:
 - **Preview mode.** First 7 days from install, L4/L5 surface as warnings instead
   of platform-blocking. Day-one users meet the system gradually.
 
+## Body signals — sleep + calendar (v7, optional)
+
+The default engine measures *agent attention*: how long you sat there typing.
+v7 adds an optional layer that asks **how that load landed** given how you slept
+and how much of your day was meetings. Same engine — sleep just adjusts the
+daily pivot, calendar adds debt. Disabled by default; users who configure
+nothing get behaviour identical to v6.
+
+**Sleep providers (pick one or more):**
+- **Apple Health.** No auth, no network. An iOS Shortcut writes nightly sleep
+  to `~/.burnout-guard/sleep/apple_health.json`, or use `burnout.py sleep
+  record --hours 7.4 --quality 75` to log manually.
+- **Oura.** Personal Access Token from
+  [cloud.ouraring.com/personal-access-tokens](https://cloud.ouraring.com/personal-access-tokens),
+  then `burnout.py sleep connect oura --token <token>`. Quality is taken from
+  daily readiness when available.
+- **Whoop.** Register an app at [developer.whoop.com](https://developer.whoop.com/)
+  with redirect `http://localhost:8765/callback`, then
+  `burnout.py sleep connect whoop --client-id <id> --client-secret <secret>` —
+  a browser opens, you log in once, refresh tokens are handled automatically.
+
+**Calendar.** Drop today's calendar at `~/.burnout-guard/calendar/today.ics`
+(any export will do — gcalcli, a Shortcut, your client's "export day" feature).
+Meeting hours and longest back-to-back stretch count as load on top of your
+agent session time.
+
+**What it does to strain (the v5 trajectory metric):**
+
+- **Good night** (≥7h *and* quality ≥70 / 100): daily pivot raised by 10%
+  *and* a small explicit recovery credit. The engine rewards sleep, not just
+  light work days.
+- **Poor night** (<6h *or* quality <50): pivot lowered by 15%. Same focus
+  hours register as more debt — because they cost more.
+- **Meeting load:** today's `meeting_hours × 0.15` + `longest_b2b_hours × 0.10`
+  added to today's debt.
+
+`burnout.py status --explain` prints the full trace — sleep last night, today's
+shifted pivot, calendar summary, debt delta. See `references/sleep-tuning.md`
+for thresholds and a tuning loop.
+
+The burnout *index* itself is unchanged in v7: still self-report (60%) +
+behaviour (40%). Body signals only feed *strain*, the 30-day trajectory
+debt — they tell you whether you're headed somewhere bad, not whether you're
+already there.
+
 ## Real enforcement + console alerts in Claude Code
 
 ```bash
